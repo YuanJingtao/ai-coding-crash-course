@@ -115,6 +115,7 @@ from this table. It is here so you can see what is supported before you start.
 | Gemini CLI      | Yes   | One command. The free Google login works.                                                |
 | Antigravity CLI | Yes   | A config file and a real Gemini API key — see below.                                     |
 | Junie           | Yes   | A config file, and a real API key pasted in — see below.                                 |
+| Qoder           | Yes   | A BYOK custom provider, if your account has that feature — see below.                    |
 | Cursor CLI      | No    | Nothing can make it work. See below.                                                     |
 | Amp             | No    | Nothing can make it work. See below.                                                     |
 
@@ -181,6 +182,75 @@ Anthropic-compatible route, an OpenAI key on the OpenAI-compatible one.
 Treat that file the way you would any other file holding a real key: do not
 commit it.
 
+### Qoder
+
+Qoder CLI (`qodercli`) reaches models two unrelated ways, and this tool can
+only log one of them.
+
+The **BYOK route** is the one that works. There Qoder calls a base URL you give
+it, in a standard wire format, with nothing in between — the same shape as
+Junie and OMP, so no new renderer was needed. It goes through the base URL and
+wire format questions the way a custom target does.
+
+Unlike Junie, there is no config file for this tool to write. Qoder's own docs
+tell you not to set BYOK up by hand in its settings file, so the base URL goes
+into `qodercli`'s own wizard instead: run `/model`, choose **Custom**, and paste
+what this tool printed. Which URL to paste depends on the protocol you pick
+there, because Qoder joins the two differently for each one:
+
+| Protocol           | Base URL to paste          | Qoder appends       |
+| ------------------ | -------------------------- | ------------------- |
+| `anthropic`        | `http://localhost:8787`    | `/v1/messages`      |
+| `openai`           | `http://localhost:8787/v1` | `/chat/completions` |
+| `openai-responses` | `http://localhost:8787/v1` | `/responses`        |
+
+The banner's `Listening` line is the address the proxy binds, so it never
+carries the `/v1`. The note printed underneath it spells out the URL to paste,
+which is the one to copy.
+
+The wizard asks for an API key and a model ID as well. Both have to be real ones
+for whichever provider you are logging: this tool only stands between the two
+and forwards what it is given.
+
+BYOK sits behind a server-side feature gate Qoder calls `custom_providers`, and
+Qoder's docs put the feature on the Individual plan. If `/model` shows no
+**Custom** option, your account does not have it, and nothing you write into a
+local config file will make it appear — the check runs against Qoder's servers
+on every start.
+
+#### Why Qoder's default route cannot be logged
+
+The **default subscription route** — the one your Qoder login uses when you have
+not set BYOK up — cannot be logged. The reason is worth understanding, because
+it is not the reason the next section gives for Cursor and Amp.
+
+It is not simply a missing base-URL override, though that part is true and it is
+what makes the route impossible to _redirect_. Qoder elects its inference host at
+runtime from its own region-endpoint service and resolves it through Aliyun's
+HTTPDNS, and the `QODER_*_BASE_URL` names that look like overrides in the
+shipped binary are compile-time constants, not environment variables — nothing
+reads them at runtime.
+
+It is not Cursor's and Amp's reason either, and this is the part that matters.
+Qoder builds its system prompt and its tool schemas **on your machine**, and
+really does send them. They go past your network card. What stops you reading
+them is that Qoder passes the request body through an encoder in a WASM module
+first, so what crosses the wire is not the JSON that was built.
+
+This was checked against `qodercli` 1.1.47 by intercepting its TLS traffic — it
+honours `HTTPS_PROXY`, and `NODE_EXTRA_CA_CERTS` adds a certificate to its trust
+store for that one process without touching your system's. The interception
+worked; the body did not become readable. The request arrived as 285 KB of
+deterministic, high-entropy data over a 65-symbol printable alphabet, on a URL
+marked `Encode=1`. That marker is deliberate and per-endpoint: the calls Qoder
+makes without it, to its own config and codebase services, arrive as plain JSON.
+The response to the encoded request, meanwhile, came back as plain
+OpenAI-shaped JSON.
+
+So a proxy can see this traffic and cannot read it. That is a limit of this
+tool, not a property of Qoder's product — which is exactly how it differs from
+Cursor and Amp, where no proxy could ever see it at all.
+
 ### Why Cursor and Amp cannot work
 
 This is the most interesting thing in the whole lesson, so it is worth saying
@@ -197,6 +267,14 @@ Cursor and Amp are the second kind. Search the whole shipped Cursor bundle and
 you will find no system prompt text and no tool schemas at all. No proxy can
 read what your machine never sends. This is not a limit of this tool. It is a
 property of the product.
+
+There is a third kind, and it is worth not confusing it with the second. A
+vendor can build the prompt on your machine, send it, and still leave you
+unable to read it — by encoding the request body on the way out. Qoder's
+default route does exactly that; see [Qoder](#qoder) above. The distinction is
+not academic. The second kind is a permanent fact about the product, and no
+tool will ever read it. The third kind is a gap in this one, and a tool that
+could undo the encoding would read it fine.
 
 If you use Cursor or Amp, install one of the other agents to follow the lesson.
 
@@ -355,6 +433,16 @@ Be fair to the tool when you judge a failure.
   authentication and the `GOOGLE_GEMINI_BASE_URL` variable), not against real
   source or a real install, and its account sign-in route was not verified
   at all — see "Antigravity CLI" above for why that route is left out.
+- **Qoder is verified against the real binary, but its BYOK route was never
+  driven end to end.** `qodercli` is closed source and ships as compiled
+  bytecode, so its entry was checked against the strings the binary itself
+  carries — the BYOK config schema it validates, and the three path constants
+  it appends to a base URL — plus a real TLS interception of its traffic,
+  which is where the "Why Qoder's default route cannot be logged" section
+  above gets its evidence from. The BYOK route could not be driven: the
+  account this was researched on has the `custom_providers` gate switched off,
+  so `/model` shows no Custom option to paste a base URL into. What is tested
+  is the wizard's output for it and the resolution behind that output.
 - **A custom base URL is only as tested as the agent it is attached to.** The
   base URL and wire format mechanism itself is tested directly (see
   `agents.test.ts`); a specific third-party server behind it has not
@@ -380,7 +468,11 @@ line in `agents.ts`.
   no upstream host, set `alwaysCustom: true`, and give its one provider entry a
   bin and a setup file. The wizard then skips the provider question for it
   entirely and asks the two custom-base-url questions directly. See the OMP
-  entry in `agents.ts` for the whole shape.
+  entry in `agents.ts` for the whole shape. If the agent takes its base URL by
+  hand instead of from a file or a variable, the way Qoder's does, then nothing
+  carries the suffix — the banner's `Listening` line does not — so put
+  `{baseUrl}` in the note text, which is filled in exactly as a setup file body
+  is.
 - **Add a wire format:** add a renderer in `render.ts` and name it on the
   catalogue entry. Unknown shapes already fall back to pretty-printed JSON, so
   you can iterate safely.

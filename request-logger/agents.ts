@@ -186,6 +186,16 @@ interface ProviderEntry {
   bin: string;
   args?: string[];
   setup?: SetupFile[];
+  /**
+   * Prose printed under the banner. May carry `{baseUrl}`, filled in the same
+   * way env values, args and setup file bodies are.
+   *
+   * An agent whose base URL arrives as an environment variable or inside a
+   * setup file never needs this, because the command or the file already
+   * carries the suffix. An agent with neither — Qoder, whose base URL goes
+   * into its own `/model` wizard by hand — has no other way to say it, since
+   * the banner's Listening line prints the address without the suffix.
+   */
   notes?: string[];
   warnings?: string[];
   /**
@@ -339,6 +349,67 @@ const JUNIE_MERGE_NOTE =
   "This is merged into ~/.junie/config.json, not a replacement for it — add " +
   "the proxies entry and the provider key alongside whatever else is " +
   "already in that file.";
+
+/**
+ * Qoder CLI (`qodercli`) reaches models two unrelated ways, and only one of
+ * them can be logged.
+ *
+ * The BYOK route this entry covers is the ordinary shape: Qoder calls a base
+ * URL you give it, in a standard wire format, with nothing between the two.
+ * That is Junie's and OMP's shape, so it needs no renderer of its own — the
+ * wire format the student picks at the wizard decides how the capture reads.
+ *
+ * The default subscription route is the other one. It gets no entry of its
+ * own, because an agent here is either supported or refused and never both,
+ * and the BYOK route below does work — so the subscription route is a
+ * warning on that entry instead. See QODER_DEFAULT_ROUTE_WARNING for what it
+ * says, which is worth reading before assuming this entry is a gap in the
+ * catalogue.
+ *
+ * Qoder's own docs tell you not to hand-edit its settings file for BYOK, so
+ * unlike Junie there is no setup file here: the base URL goes into qodercli's
+ * own /model → Custom wizard. The notes below are what make that possible,
+ * since the wizard asks for a base URL and this tool is the one printing it.
+ */
+const QODER_ANTHROPIC_NOTE =
+  "In qodercli, run /model, choose Custom, set the protocol to anthropic and " +
+  "paste this base URL: {baseUrl} — with no /v1 on the end. Qoder appends " +
+  "the whole /v1/messages path itself, so a base URL that already carries /v1 " +
+  "produces /v1/v1/messages and a 404 that looks like this tool is broken. " +
+  "Qoder also asks for an API key and a model ID; both have to be real ones " +
+  "for whichever provider you are logging, because this tool only stands " +
+  "between the two and forwards what it is given.";
+
+const QODER_OPENAI_NOTE =
+  "In qodercli, run /model, choose Custom, set the protocol to openai — or " +
+  "openai-responses, which this tool reads the same way it reads Codex's — " +
+  "and paste this base URL: {baseUrl}. The /v1 stays on it here, and the " +
+  "banner above prints the listening address without it: Qoder appends only " +
+  "/chat/completions for openai and /responses for openai-responses, so " +
+  "pasting the shorter form sends the call to a path nothing answers. Qoder " +
+  "also asks for an API key and a model ID; both have to be real ones for " +
+  "whichever provider you are logging, because this tool only stands between " +
+  "the two and forwards what it is given.";
+
+const QODER_GATE_WARNING =
+  "Qoder's BYOK route sits behind a server-side feature gate Qoder calls " +
+  "custom_providers, and its own docs put the feature on the Individual " +
+  "plan. If /model shows no Custom option, your account does not have the " +
+  "gate, and nothing you write into a local config file will make it " +
+  "appear — the check happens against Qoder's servers on every start.";
+
+const QODER_DEFAULT_ROUTE_WARNING =
+  "Qoder's default subscription route cannot be logged, for a reason this " +
+  "catalogue had not met before and that is worth understanding. Cursor and " +
+  "Amp build their system prompt on their own servers, so no proxy can ever " +
+  "read it. Qoder builds its prompt and its tool schemas on your machine and " +
+  "really does send them — but it passes the request body through an encoder " +
+  "in a WASM module first, so what crosses the wire is not readable, and the " +
+  "route offers no base-URL override to redirect it with. Verified against " +
+  "qodercli 1.1.47 by intercepting its TLS traffic: the response came back " +
+  "as plain OpenAI-shaped JSON, while the request arrived as 285 KB of " +
+  "deterministic, high-entropy data over a 65-symbol printable alphabet. " +
+  "This is a limit of this tool, not a property of Qoder's product.";
 
 /**
  * Antigravity CLI (`agy`) is a separate Google product from Gemini CLI — a
@@ -830,6 +901,55 @@ const AGENTS: AgentEntry[] = [
     ],
   },
   {
+    id: "qoder",
+    label: "Qoder",
+    // Qoder is BYOK across whichever provider the student names, with no
+    // fixed host of its own — the same shape as Junie and OMP — so every
+    // setup for it is custom too. See AgentEntry.alwaysCustom, and the
+    // Qoder comment above the notes for why its other route is not here.
+    //
+    // Verified against qodercli 1.1.47 by intercepting its TLS traffic, but
+    // only as far as the wire format its BYOK config accepts: the account
+    // this was researched on has the custom_providers gate switched off, so
+    // the BYOK route itself was never driven end to end. Testing status is
+    // recorded in the README's "How much this was tested" section, the same
+    // way every other agent's is.
+    alwaysCustom: true,
+    providers: [
+      {
+        id: "anthropic",
+        label: "Anthropic-compatible",
+        // Unused: Qoder never reaches the normal (non-custom) resolution
+        // path that would read this. See resolveCustomTarget.
+        upstreamHost: "",
+        renderer: "raw",
+        bin: "qodercli",
+        customTemplateFor: ["anthropic"],
+        notes: [QODER_ANTHROPIC_NOTE],
+        warnings: [QODER_GATE_WARNING, QODER_DEFAULT_ROUTE_WARNING],
+      },
+      {
+        id: "openai",
+        label: "OpenAI-compatible",
+        // Unused, same as the Anthropic-compatible entry above: Qoder never
+        // reaches the normal (non-custom) resolution path that would read
+        // this. See resolveCustomTarget.
+        upstreamHost: "",
+        renderer: "raw",
+        bin: "qodercli",
+        // Also the catch-all for "raw"/not sure — see the OpenCode, Pi and
+        // Junie entries above for why an OpenAI-compatible guess is the
+        // better default for an unidentified custom server.
+        customTemplateFor: ["openai", "raw"],
+        // Qoder appends only the last path segment for these two protocols,
+        // so the /v1 has to already be on the base URL this prints.
+        suffix: "/v1",
+        notes: [QODER_OPENAI_NOTE],
+        warnings: [QODER_GATE_WARNING, QODER_DEFAULT_ROUTE_WARNING],
+      },
+    ],
+  },
+  {
     id: "amp",
     label: "Amp",
     reason:
@@ -1294,7 +1414,7 @@ function resolveCustomTarget(
       ...file,
       body: file.body.replace(/\{baseUrl\}/g, baseUrl),
     })),
-    notes,
+    notes: notes.map((note) => note.replace(/\{baseUrl\}/g, baseUrl)),
     warnings: template?.warnings ?? [],
   };
 }
@@ -1394,7 +1514,9 @@ export function resolveChoice(
       ...file,
       body: file.body.replace(/\{baseUrl\}/g, baseUrl),
     })),
-    notes: provider.notes ?? [],
+    notes: (provider.notes ?? []).map((note) =>
+      note.replace(/\{baseUrl\}/g, baseUrl)
+    ),
     warnings: provider.warnings ?? [],
   };
 }
