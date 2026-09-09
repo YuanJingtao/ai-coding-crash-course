@@ -17,6 +17,7 @@
 
 import zlib from "node:zlib";
 import type { RendererId } from "./agents";
+import { decodeQoderBody } from "./qoder-codec";
 
 interface RenderInput {
   /** Human label for the capture, e.g. "Claude Code" or "Pi (ChatGPT)". */
@@ -34,12 +35,43 @@ interface RenderInput {
   responseRaw: string;
 }
 
-const REDACT = new Set([
+/**
+ * The words that make a name a credential rather than data.
+ *
+ * Matched per segment, on a suffix — see isSecretName. Qoder's real request
+ * headers are what forced that: `cosy-key` and `cosy-machinetoken` are
+ * credentials with no `api` in front of them, and arrived in the Markdown in
+ * full, while the substring match that would have caught them also hid
+ * `max_input_tokens`, the one number in model_config worth reading.
+ */
+const SECRET_WORDS = [
+  "key",
+  "token",
+  "secret",
+  "password",
   "authorization",
-  "x-api-key",
-  "api-key",
-  "x-goog-api-key",
-]);
+  "credential",
+  "cookie",
+];
+
+/**
+ * Whether a header or body-field name holds a credential.
+ *
+ * Split on the separators names actually use, then ask whether any segment
+ * *ends* with one of SECRET_WORDS. Ending rather than equalling is what
+ * catches the unseparated ones — `machinetoken`, `apikey`; splitting first is
+ * what spares `tokens`, so `prompt_tokens` and `max_input_tokens` stay
+ * readable.
+ *
+ * This over-redacts `model_config.key`, the model's name. That costs nothing:
+ * findModel reads it before redaction and puts it in <meta>.
+ */
+function isSecretName(name: string): boolean {
+  return name
+    .toLowerCase()
+    .split(/[-_]/)
+    .some((segment) => SECRET_WORDS.some((word) => segment.endsWith(word)));
+}
 
 /**
  * Turn the raw request bytes into text.
@@ -86,13 +118,55 @@ export function decodeRequestBody(body: Buffer, encoding?: string): string {
 function decodeFailureWarning(body: Buffer, reason: string): string {
   return (
     `[request-logger] COULD NOT DECODE THIS BODY — ${reason}\n\n` +
-    "The bytes below are still compressed. They are NOT what was actually sent as text:\n\n" +
+    "The bytes below are the body exactly as it arrived. They are NOT the text that was sent:\n\n" +
     body.toString("utf8")
   );
 }
 
+/**
+ * The request body as text, with every layer this tool knows how to take off
+ * removed: content-encoding first, then Qoder's body encoding when that is the
+ * wire format.
+ */
+function decodeRequestText(input: RenderInput): string {
+  const text = decodeRequestBody(input.requestBody, input.requestEncoding);
+  if (input.renderer !== "qoder") return text;
+  return decodeQoderRequestText(text);
+}
+
+/**
+ * Undo the encoding Qoder's subscription route applies to its request bodies.
+ * See qoder-codec.ts for what that encoding turns out to be.
+ *
+ * A body that is already JSON is left alone: `Encode=1` is a per-endpoint
+ * marker, so not every call Qoder makes is encoded, and running the decoder
+ * over a readable body would turn it into noise.
+ */
+export function decodeQoderRequestText(text: string): string {
+  const trimmed = text.trim();
+  if (trimmed === "") return trimmed;
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return trimmed;
+
+  try {
+    const decoded = decodeQoderBody(trimmed);
+    // Proven rather than assumed. The plaintext is always a JSON object, so a
+    // decode that does not parse is a decode that got the transform wrong —
+    // most likely because a Qoder release changed it. Showing that anyway
+    // would produce a readable-looking document that was never sent, which is
+    // the one failure this tool must not have.
+    JSON.parse(decoded);
+    return decoded;
+  } catch (err) {
+    return decodeFailureWarning(
+      Buffer.from(text),
+      `this body looks like one Qoder encoded, but it did not decode: ` +
+        `${(err as Error).message}`
+    );
+  }
+}
+
 export function renderMarkdown(input: RenderInput): string {
-  const requestText = decodeRequestBody(input.requestBody, input.requestEncoding);
+  const requestText = decodeRequestText(input);
 
   let reqJson: any = null;
   try {
@@ -103,19 +177,67 @@ export function renderMarkdown(input: RenderInput): string {
 
   const model = findModel(reqJson, input.path);
 
-  return (
+  const document =
     [
       renderMeta(input, model),
       renderHeaders(input.headers),
       "<request>\n\n" + renderRequest(input, reqJson, requestText) + "\n\n</request>",
       "<response>\n\n" + renderResponse(input, reqJson) + "\n\n</response>",
-    ].join("\n\n") + "\n"
-  );
+    ].join("\n\n") + "\n";
+
+  return scrubSecretValues(document, secretValues(input.headers));
+}
+
+/**
+ * Shortest value worth scrubbing by content rather than only by name.
+ *
+ * Below this a secret-named header could hold an ordinary word, and replacing
+ * every occurrence of one would rewrite what was actually sent — the one thing
+ * this tool must not do. The header line is still hidden by name regardless.
+ */
+const MIN_SCRUBBED_SECRET = 16;
+
+/**
+ * The credential strings a request's headers carry.
+ *
+ * Redacting by name hides the line a secret arrived on and nothing else. Qoder
+ * sends the same string as both `cosy-machinetoken` and `cosy-machineid`, so
+ * hiding the first left the second printing it in full, and a body can echo a
+ * token it was given. The values are collected here so the whole document can be
+ * scrubbed of them, longest first: one secret can contain another, and
+ * replacing the shorter one first would leave a fragment of the longer.
+ */
+function secretValues(headers: RenderInput["headers"]): string[] {
+  const found: string[] = [];
+  for (const [key, value] of Object.entries(headers)) {
+    if (!isSecretName(key)) continue;
+    for (const item of Array.isArray(value) ? value : [value]) {
+      if (typeof item !== "string") continue;
+      const trimmed = item.trim();
+      // `Bearer abc…` counts twice: the whole header, and the credential after
+      // the scheme, which is the part a body would echo.
+      const scheme = trimmed.indexOf(" ");
+      const parts = scheme > 0 ? [trimmed, trimmed.slice(scheme + 1).trim()] : [trimmed];
+      found.push(...parts.filter((part) => part.length >= MIN_SCRUBBED_SECRET));
+    }
+  }
+  return [...new Set(found)].sort((a, b) => b.length - a.length);
+}
+
+function scrubSecretValues(document: string, values: string[]): string {
+  let out = document;
+  for (const value of values) out = out.split(value).join("[REDACTED]");
+  return out;
 }
 
 /** Most APIs name the model in the body. Gemini names it in the URL. */
 function findModel(reqJson: any, path: string): string {
   if (typeof reqJson?.model === "string") return reqJson.model;
+  // Qoder's subscription route has no top-level `model` at all; it names the
+  // model inside model_config, alongside the route it was reached by.
+  if (typeof reqJson?.model_config?.key === "string" && reqJson.model_config.key !== "") {
+    return reqJson.model_config.key;
+  }
   const fromPath = path.match(/models\/([^:/?]+)/);
   if (fromPath) return fromPath[1];
   return "unknown";
@@ -138,7 +260,7 @@ function renderMeta(input: RenderInput, model: string): string {
 
 function renderHeaders(headers: RenderInput["headers"]): string {
   const lines = Object.entries(headers).map(([key, value]) => {
-    const shown = REDACT.has(key.toLowerCase())
+    const shown = isSecretName(key)
       ? "[REDACTED]"
       : Array.isArray(value)
         ? value.join(", ")
@@ -193,6 +315,7 @@ function renderRequest(
   try {
     if (input.renderer === "anthropic") return renderAnthropicRequest(reqJson);
     if (input.renderer === "gemini") return renderGeminiRequest(reqJson);
+    if (input.renderer === "qoder") return renderQoderRequest(reqJson);
     return renderOpenAIRequest(reqJson);
   } catch (err) {
     return (
@@ -648,6 +771,271 @@ function renderGeminiResponse(raw: string): string {
   return out.length ? out.join("\n\n") : "_(no content decoded)_";
 }
 
+// ---- Qoder ------------------------------------------------------------------
+//
+// Qoder's subscription route sends a body of its own shape, and it is not
+// OpenAI's: the system prompt is a top-level string rather than a message or an
+// `instructions` field, the sampling parameters are nested under `parameters`,
+// the model is named inside `model_config`, and every message carries its parts
+// twice. Qoder's newer model-server transport, reached over a different path,
+// posts an ordinary chat/completions body instead. Both arrive under this one
+// renderer id, so the shape decides which is read — not the path, which is
+// Qoder's to change and this tool's to discover too late.
+
+const QODER_PARAM_KEYS = [
+  "temperature",
+  "top_p",
+  "top_k",
+  "max_tokens",
+  "stop",
+  "reasoning_effort",
+  "enable_thinking",
+  "reasoning_budget_tokens",
+  "preserve_thinking",
+  "context_length",
+  "tool_choice",
+];
+
+/** The top-level fields that get a section of their own, so <other-fields> holds only the rest. */
+const QODER_SECTIONED_KEYS = new Set([
+  "system",
+  "messages",
+  "tools",
+  "parameters",
+  "model_config",
+  "patches",
+  "stream",
+]);
+
+/**
+ * Hide the credentials inside a request body, not just the ones in headers.
+ *
+ * Qoder puts a BYOK key in `model_config.api_key`, and <other-fields> below
+ * dumps everything it has no section for, which is exactly where an
+ * unanticipated one would land. isSecretName is the same rule the headers use,
+ * applied on the way in.
+ */
+function redactSecrets(value: any): any {
+  if (Array.isArray(value)) return value.map(redactSecrets);
+  if (value === null || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.entries(value).map(([key, item]) => [
+      key,
+      isSecretName(key) && item ? "[REDACTED]" : redactSecrets(item),
+    ])
+  );
+}
+
+function isQoderSubscriptionBody(j: any): boolean {
+  return j?.model_config != null || j?.chat_task != null || typeof j?.system === "string";
+}
+
+/**
+ * Qoder's system prompt, from whichever of the two places it arrives in.
+ *
+ * The builder in qodercli 1.1.46 fills a top-level `system` string, and a live
+ * 1.1.47 request had no such field at all — only a leading `{role:"system"}`
+ * message. Reading just the first left the real prompt rendered as an ordinary
+ * message: present, but not where anyone looks for a system prompt, which is
+ * the single thing this tool exists to show.
+ */
+function qoderSystem(j: any): string {
+  if (typeof j.system === "string" && j.system !== "") return j.system;
+  const first = Array.isArray(j.messages) ? j.messages[0] : undefined;
+  if (first?.role !== "system") return "";
+  return renderQoderParts(first.contents ?? first.content);
+}
+
+function renderQoderRequest(j: any): string {
+  if (!isQoderSubscriptionBody(j)) return renderOpenAIRequest(j);
+
+  const parts: string[] = [];
+
+  const params = renderParams(
+    { ...(j.parameters ?? {}), stream: j.stream },
+    [...QODER_PARAM_KEYS, "stream"]
+  );
+  if (params) parts.push(params);
+
+  if (j.model_config != null) parts.push(renderQoderModelConfig(j.model_config));
+
+  const system = qoderSystem(j);
+  if (system !== "") {
+    parts.push(["<system-prompt>", "", system, "", "</system-prompt>"].join("\n"));
+  }
+
+  // Qoder's tools are already in OpenAI chat form, so they need no renderer
+  // of their own.
+  if (Array.isArray(j.tools) && j.tools.length > 0) {
+    parts.push(renderOpenAITools(j.tools));
+  }
+
+  if (j.patches != null) parts.push(renderQoderPatches(j.patches));
+
+  parts.push(renderMessages(qoderMessages(j.messages, system), renderQoderContent));
+
+  const rest = redactSecrets(
+    Object.fromEntries(
+      Object.entries(j).filter(([key]) => !QODER_SECTIONED_KEYS.has(key))
+    )
+  );
+  if (Object.keys(rest).length > 0) {
+    parts.push(["<other-fields>", "", fenceJson(rest), "", "</other-fields>"].join("\n"));
+  }
+
+  return parts.join("\n\n");
+}
+
+function renderQoderModelConfig(config: any): string {
+  const lines = ["<model-config>", ""];
+  for (const [key, value] of Object.entries(config)) {
+    const shown =
+      isSecretName(key) && value
+        ? "[REDACTED]"
+        : typeof value === "object" && value !== null
+          ? JSON.stringify(value)
+          : String(value);
+    lines.push(`- **${key}**: ${shown}`);
+  }
+  lines.push("", "</model-config>");
+  return lines.join("\n");
+}
+
+function renderQoderPatches(patches: any): string {
+  return [
+    "<patches>",
+    "",
+    "Edits to the system prompt that Qoder was asked to apply, not content",
+    "standing in for a message. This tool cannot tell from the body whether the",
+    "prompt above already has them applied, so treat the two as separate.",
+    "",
+    fenceJson(patches),
+    "",
+    "</patches>",
+  ].join("\n");
+}
+
+/**
+ * The messages to render, with the system message dropped when it is the
+ * prompt already shown under <system-prompt>.
+ *
+ * qoderSystem took that prompt either from the top-level `system` string or
+ * from this very message, so comparing rather than assuming is what makes both
+ * work. When it came from the message, the two are equal by construction and it
+ * is dropped; when it came from `system`, it is dropped only if the message
+ * holds the same text, and a differing one stays because it is real content.
+ *
+ * Indices in the rendered list are therefore positions in what is shown, not
+ * offsets into the array Qoder sent. The body as sent is in .request.txt.
+ */
+function qoderMessages(messages: any, system: string): any[] {
+  if (!Array.isArray(messages)) return [];
+  const [first, ...rest] = messages;
+  if (
+    system !== "" &&
+    first?.role === "system" &&
+    renderQoderParts(first.contents ?? first.content) === system
+  ) {
+    return rest;
+  }
+  return messages;
+}
+
+function renderQoderContent(msg: any): string {
+  const out: string[] = [];
+
+  if (typeof msg?.reasoning_content === "string" && msg.reasoning_content !== "") {
+    out.push(["<thinking>", "", msg.reasoning_content, "", "</thinking>"].join("\n"));
+  }
+  if (msg?.reasoning_item != null) {
+    out.push(renderQoderReasoningItem(msg.reasoning_item));
+  }
+
+  // Every wire message carries its parts twice: `content`, joined into a
+  // string, and `contents`, the parts themselves. The parts are the superset —
+  // they are where cache markers and images live — so they win when present.
+  const text = renderQoderParts(msg?.contents ?? msg?.content);
+
+  if (msg?.role === "tool") {
+    out.push(
+      [
+        `<tool-result tool-call-id="${msg.tool_call_id ?? ""}" is-error="${!!msg.is_error}">`,
+        "",
+        text,
+        "",
+        "</tool-result>",
+      ].join("\n")
+    );
+  } else if (text !== "") {
+    out.push(text);
+  }
+
+  if (Array.isArray(msg?.tool_calls)) {
+    for (const call of msg.tool_calls) {
+      const fn = call?.function ?? {};
+      out.push(
+        [
+          `<tool-use name="${fn.name ?? ""}" id="${call?.id ?? ""}">`,
+          "",
+          fence(fn.arguments ?? "", "json"),
+          "",
+          "</tool-use>",
+        ].join("\n")
+      );
+    }
+  }
+
+  return out.join("\n\n");
+}
+
+function renderQoderReasoningItem(item: any): string {
+  const summary = Array.isArray(item?.summary)
+    ? item.summary
+        .map((entry: any) =>
+          typeof entry?.text === "string" ? entry.text : fenceJson(entry)
+        )
+        .join("\n\n")
+    : "";
+  // `encrypted_content` is opaque by design: Qoder sends it back on the next
+  // turn so the model can resume a reasoning chain, and nothing on this side
+  // can read it. Say that, rather than printing it or quietly leaving it out.
+  const encrypted =
+    typeof item?.encrypted_content === "string" && item.encrypted_content !== ""
+      ? `\`[reasoning_item.encrypted_content: ${item.encrypted_content.length} chars, opaque — full data in .request.txt]\``
+      : "";
+  const inner = [summary, encrypted].filter((part) => part !== "").join("\n\n");
+  return ["<thinking>", "", inner === "" ? fenceJson(item) : inner, "", "</thinking>"].join(
+    "\n"
+  );
+}
+
+function renderQoderParts(value: any): string {
+  if (typeof value === "string") return value;
+  if (!Array.isArray(value)) return value == null ? "" : fenceJson(value);
+  return value
+    .map((part) => {
+      switch (part?.type) {
+        case "text": {
+          const text = typeof part.text === "string" ? part.text : "";
+          return part.cache_control ? `${text}\n\n<!-- cache_control breakpoint -->` : text;
+        }
+        case "image_url": {
+          const url: string = part.image_url?.url ?? "";
+          const comma = url.indexOf(",");
+          const payload = comma === -1 ? url : url.slice(comma + 1);
+          return `\`[image: ${payload.length} base64 chars — full data in .request.txt]\``;
+        }
+        case "input_audio":
+          return `\`[input audio: ${part.input_audio?.format ?? "unknown"}, ${
+            (part.input_audio?.data ?? "").length
+          } base64 chars — full data in .request.txt]\``;
+        default:
+          return fenceJson(part);
+      }
+    })
+    .join("\n\n");
+}
+
 // ---- shared message list ----------------------------------------------------
 
 function renderMessages(
@@ -710,6 +1098,13 @@ function renderResponse(input: RenderInput, reqJson: any): string {
     }
     if (input.renderer === "anthropic") return renderAnthropicResponse(raw);
     if (input.renderer === "gemini") return renderGeminiResponse(raw);
+    if (input.renderer === "qoder") {
+      return renderOpenAIResponse(
+        raw,
+        reqJson,
+        sseData(raw).map(unwrapQoderEnvelope).filter((event) => event != null)
+      );
+    }
     return renderOpenAIResponse(raw, reqJson);
   } catch (err) {
     return (
@@ -734,6 +1129,37 @@ function sseData(raw: string): any[] {
     }
   }
   return out;
+}
+
+/**
+ * Take one event out of the envelope Qoder's subscription route wraps it in.
+ *
+ * What arrives is not the model's chunk but the upstream's whole reply, with
+ * the chunk as a JSON *string* inside it:
+ *
+ *     data:{"headers":{…},"body":"{\"choices\":[…]}","statusCodeValue":200,"statusCode":"OK"}
+ *
+ * Read straight as an OpenAI stream that is a sequence of events with no
+ * `choices` in any of them, so an entire reply renders as "no content decoded"
+ * — which is exactly what a live run produced before this existed. The `[DONE]`
+ * sentinel travels inside the envelope too, so it arrives as a body that is not
+ * a chunk.
+ *
+ * Per event rather than once for the stream, because the same renderer serves
+ * Qoder's BYOK route, which sends an ordinary unwrapped OpenAI stream, and
+ * because the envelope's own trailing `event:finish` timings object has no body
+ * at all. Anything unreadable becomes null and is dropped by the caller, which
+ * is what sseData already does with a line it cannot parse.
+ */
+function unwrapQoderEnvelope(event: any): any {
+  if (typeof event?.body !== "string") return event;
+  if (event.statusCode == null && event.statusCodeValue == null) return event;
+  if (event.body === "[DONE]") return null;
+  try {
+    return JSON.parse(event.body);
+  } catch {
+    return null;
+  }
 }
 
 function renderAnthropicResponse(raw: string): string {
@@ -798,8 +1224,13 @@ function renderAnthropicResponse(raw: string): string {
   return parts.join("\n\n");
 }
 
-function renderOpenAIResponse(raw: string, reqJson: any): string {
-  const events = sseData(raw);
+function renderOpenAIResponse(
+  raw: string,
+  reqJson: any,
+  // Supplied by a caller that had to transform the events before they could be
+  // read as an OpenAI stream — Qoder's, which arrive inside an envelope.
+  events: any[] = sseData(raw)
+): string {
   const isResponses = events.some(
     (e) => typeof e.type === "string" && e.type.startsWith("response.")
   );
@@ -810,6 +1241,7 @@ function renderOpenAIResponse(raw: string, reqJson: any): string {
 
 function renderOpenAIChatStream(events: any[]): string {
   let text = "";
+  let reasoning = "";
   const toolCalls: Record<number, { name: string; args: string; id?: string }> = {};
   let finish: string | undefined;
   let usage: any;
@@ -818,6 +1250,11 @@ function renderOpenAIChatStream(events: any[]): string {
     const choice = ev.choices?.[0];
     const delta = choice?.delta ?? {};
     if (typeof delta.content === "string") text += delta.content;
+    // Qoder, DeepSeek and Qwen all stream a model's reasoning alongside its
+    // answer, in this field rather than in a content part. It is part of what
+    // came back, so it is shown — ahead of the answer, which is the order the
+    // model produced it in.
+    if (typeof delta.reasoning_content === "string") reasoning += delta.reasoning_content;
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
         const idx = tc.index ?? 0;
@@ -835,6 +1272,7 @@ function renderOpenAIChatStream(events: any[]): string {
   if (finish) parts.push(`- **finish reason**: ${finish}`);
   if (usage) parts.push(`- **usage**: ${JSON.stringify(usage)}`);
   if (parts.length) parts.push("");
+  if (reasoning) parts.push(["<thinking>", "", reasoning, "", "</thinking>"].join("\n"));
   if (text) parts.push(["<assistant-text>", "", text, "", "</assistant-text>"].join("\n"));
   for (const idx of Object.keys(toolCalls).map(Number).sort((a, b) => a - b)) {
     const tc = toolCalls[idx];

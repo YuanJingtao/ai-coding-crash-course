@@ -4,6 +4,7 @@ import {
   agentProviders,
   CUSTOM_ID,
   customTargetNeedsModel,
+  isMitmTarget,
   ISSUE_URL,
   listAgents,
   listProviders,
@@ -11,7 +12,9 @@ import {
   resolveChoice,
   shouldLogRequest,
   type AgentChoice,
+  type RendererId,
 } from "./agents";
+import { CA_CERT_PATH } from "./certs";
 
 const PORT = { port: 8787, platform: "linux" as NodeJS.Platform };
 
@@ -130,8 +133,7 @@ describe("listAgents", () => {
 
   it("says no other agent is always custom", () => {
     const others = listAgents().filter(
-      (agent) =>
-        agent.id !== "omp" && agent.id !== "junie" && agent.id !== "qoder"
+      (agent) => agent.id !== "omp" && agent.id !== "junie"
     );
     expect(others.every((agent) => agent.alwaysCustom === false)).toBe(true);
   });
@@ -156,32 +158,25 @@ describe("listAgents", () => {
     expect(junie?.needsProvider).toBe(false);
   });
 
-  it("marks Qoder as supported and always custom", () => {
+  it("marks Qoder as supported, and as not always custom", () => {
+    // Qoder used to be alwaysCustom, back when its BYOK route was the only
+    // one this tool could reach. It has a real catalogue provider now — the
+    // subscription route, reached over MITM — so the wizard offers that one
+    // directly and offers "Custom base URL" beside it, the way it does for
+    // every other supported agent.
     const qoder = listAgents().find((agent) => agent.id === "qoder");
     expect(qoder?.supported).toBe(true);
-    expect(qoder?.alwaysCustom).toBe(true);
+    expect(qoder?.alwaysCustom).toBe(false);
   });
 
-  it("says Qoder needs no provider question either, even though it has two internal templates", () => {
+  it("says Qoder has one route to pick, not the three its entry holds", () => {
+    // Its catalogue entry holds three providers, but two of them are
+    // templates for the custom-base-url route rather than choices — see
+    // ProviderEntry.templateOnly. One pickable provider means nothing to
+    // choose between, exactly as for Copilot. askChoice still asks, so that
+    // "Custom base URL" stays reachable.
     const qoder = listAgents().find((agent) => agent.id === "qoder");
     expect(qoder?.needsProvider).toBe(false);
-  });
-
-  it("counts Qoder as loggable even though only one of its two model routes is", () => {
-    // Qoder's default subscription route encodes its request body before it
-    // leaves the process, so that route can never be read — but its BYOK
-    // route talks to a base URL the student supplies in a standard wire
-    // format, which this tool logs like any other. An agent is either
-    // supported or refused and never both, so the route that works decides
-    // the listing and the route that does not becomes a warning on it. See
-    // QODER_DEFAULT_ROUTE_WARNING, and the "resolveChoice — Qoder" tests
-    // below for what that warning has to say.
-    const qoder = listAgents().find((agent) => agent.id === "qoder");
-    expect(qoder?.supported).toBe(true);
-    const supported = listAgents().map((agent) => agent.supported);
-    expect(supported.indexOf(false)).toBeGreaterThan(
-      supported.lastIndexOf(true)
-    );
   });
 });
 
@@ -257,16 +252,17 @@ describe("agentProviders", () => {
     ]);
   });
 
-  it("returns Qoder's two internal template providers, even though the wizard never shows them", () => {
-    // Same reasoning as Junie above. Qoder needs two rather than one because
-    // the base URL it prints genuinely differs by protocol: Qoder appends the
-    // whole /v1/messages path for anthropic, but only /chat/completions or
-    // /responses for the OpenAI protocols, so the second template carries a
-    // /v1 suffix the first must not.
-    expect(agentProviders("qoder").map((p) => p.id)).toEqual([
-      "anthropic",
-      "openai",
-    ]);
+  it("returns only Qoder's subscription route, and hides its two templates", () => {
+    // Unlike OMP and Junie above, Qoder is not alwaysCustom, so config.ts
+    // really does build its provider question from this list — and the two
+    // BYOK entries must not appear in it. They carry no upstream host, so a
+    // student who picked one would get a target that forwards nowhere. They
+    // are still in the catalogue, tagged templateOnly, for
+    // findCustomTemplate to borrow a command, a suffix and notes from once
+    // the student picks "Custom base URL" and a wire format instead — see
+    // the BYOK tests below, which still resolve through them.
+    expect(agentProviders("qoder").map((p) => p.id)).toEqual(["subscription"]);
+    expect(listProviders("qoder")).toEqual([]);
   });
 });
 
@@ -875,6 +871,40 @@ describe("shouldLogRequest", () => {
     expect(
       shouldLogRequest("POST", "/v1internal:recordCodeAssistMetrics", "gemini")
     ).toBe(false);
+  });
+
+  it("logs a real Qoder subscription turn", () => {
+    expect(
+      shouldLogRequest(
+        "POST",
+        "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1",
+        "qoder"
+      )
+    ).toBe(true);
+  });
+
+  it("logs Qoder's plain-HTTP model transport too", () => {
+    expect(
+      shouldLogRequest("POST", "/model/v1/chat/completions", "qoder")
+    ).toBe(true);
+  });
+
+  it("drops the rest of qodercli's traffic, which MITM also sees", () => {
+    // This is the only renderer that watches a whole process rather than one
+    // agent's model calls, so the rule has to be a whitelist. The generic
+    // blacklist below would happily write a document for every one of these:
+    // none of them mentions token counting, and all of them are POSTs.
+    for (const path of [
+      "/api/v1/tracking",
+      "/api/v5/service/region/endpoints",
+      "/api/v2/model/list",
+      "/algo/api/v2/service/business/finish",
+      "/api/v1/auth/token",
+      "/api/v1/codebase/status",
+      "/v1/chat/completions",
+    ]) {
+      expect(shouldLogRequest("POST", path, "qoder")).toBe(false);
+    }
   });
 });
 
@@ -1638,15 +1668,238 @@ describe("resolveChoice — Junie", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Qoder — every setup is custom, two templates that differ by the base URL
-// they print, and a second model route that cannot be logged at all
+// Qoder — one real catalogue route, reached over MITM because it elects its
+// own host, and two templates behind the custom-base-url option that differ
+// by the base URL they print
 // ---------------------------------------------------------------------------
 
-describe("resolveChoice — Qoder", () => {
-  it("resolves Qoder straight from a base URL and wire format, with no provider needed", () => {
+describe("resolveChoice — Qoder subscription", () => {
+  const SUBSCRIPTION = { agent: "qoder", provider: "subscription" };
+
+  it("resolves to a catalogue target, with nothing typed in", () => {
+    // The route every Qoder account has. Unlike the BYOK one below it needs
+    // no base URL, no API key and no wire-format answer, so picking it at
+    // the wizard is the end of the questions.
+    expect(resolveChoice(SUBSCRIPTION, PORT).kind).toBe("target");
+  });
+
+  it("says it is a MITM target, which is what makes proxy.ts listen for CONNECT", () => {
+    expect(target("qoder", "subscription").mitm).toBe(true);
+    expect(isMitmTarget(resolveChoice(SUBSCRIPTION, PORT))).toBe(true);
+  });
+
+  it("names the hosts it decrypts, so the rest can be passed through unread", () => {
+    // qodercli holds more than one TLS client and they do not all read
+    // NODE_EXTRA_CA_CERTS, so a tunnel terminated for the wrong one is a tunnel
+    // broken. Only the host a model call can be on is worth the risk.
+    const hosts = target("qoder", "subscription").mitmHosts;
+    expect(hosts).toBeInstanceOf(RegExp);
+    // Every name below was minted a certificate by a live qodercli 1.1.47 run.
+    expect(hosts!.test("b1731805-d1a6-41f6-9de4-52d8d015da84-api.qoder.xin")).toBe(true);
+    for (const host of [
+      "center.qoder.sh",
+      "openapi.qoder.sh",
+      "api3.qoder.sh",
+      "api5.qoder.com.cn",
+      "download.qoder.com",
+      "qoder-ide.oss-accelerate.aliyuncs.com",
+    ]) {
+      expect(hosts!.test(host)).toBe(false);
+    }
+  });
+
+  it("says no other route in the catalogue is a MITM one", () => {
+    // One process still means one upstream host everywhere else, and the
+    // whole MITM path exists to preserve that rather than to replace it.
+    const others = [
+      ["claude-code", "anthropic"],
+      ["claude-code", "vertex"],
+      ["codex", "openai"],
+      ["codex", "chatgpt"],
+      ["copilot", undefined],
+      ["opencode", "anthropic"],
+      ["opencode", "openai"],
+      ["pi", "anthropic"],
+      ["pi", "openai"],
+      ["pi", "codex"],
+      ["gemini", "google-login"],
+      ["gemini", "api-key"],
+      ["antigravity", "api-key"],
+    ] as const;
+    for (const [agent, provider] of others) {
+      const resolved = target(agent, provider);
+      expect(resolved.mitm).toBe(false);
+      expect(isMitmTarget(resolved)).toBe(false);
+      expect(resolved.mitmHosts).toBeUndefined();
+    }
+  });
+
+  it("reads the capture with the qoder renderer", () => {
+    expect(target("qoder", "subscription").renderer).toBe("qoder");
+  });
+
+  it("names no upstream host, because the host arrives with each connection", () => {
+    // Every other target forwards to a host chosen here. This one cannot:
+    // Qoder elects its own at runtime, behind a tenant-prefixed domain, and
+    // offers no override, so mitm.ts fills this in per connection instead.
+    expect(target("qoder", "subscription").upstreamHost).toBe("");
+  });
+
+  it("prints no base URL, because nothing points at this proxy by URL", () => {
+    // Left empty rather than filled with the listening address, which would
+    // read like something to paste somewhere.
+    expect(target("qoder", "subscription").baseUrl).toBe("");
+  });
+
+  it("routes qodercli here with two variables and nothing else", () => {
+    expect(target("qoder", "subscription").command).toBe(
+      `HTTPS_PROXY=http://127.0.0.1:8787 NODE_EXTRA_CA_CERTS=${CA_CERT_PATH} qodercli`
+    );
+  });
+
+  it("points HTTPS_PROXY at 127.0.0.1 rather than at localhost", () => {
+    // A proxy that resolves "localhost" to ::1 first is unreachable for an
+    // agent that only ever tries the IPv4 answer. The base URL every other
+    // agent gets is still localhost, because that one is pasted by a human
+    // into a config that does its own resolving.
+    const command = target("qoder", "subscription").command;
+    expect(command).toContain("HTTPS_PROXY=http://127.0.0.1:8787");
+    expect(command).not.toContain("HTTPS_PROXY=http://localhost");
+  });
+
+  it("fills both placeholders rather than printing them", () => {
+    const command = target("qoder", "subscription").command;
+    expect(command).not.toContain("{proxyUrl}");
+    expect(command).not.toContain("{caPath}");
+    expect(command).toContain(CA_CERT_PATH);
+  });
+
+  it("hands the shell the whole CA path, not the first word of it", () => {
+    // The value that reaches qodercli has to be the entire path. A repo
+    // cloned under a directory with a space in it is what this exists for:
+    // unquoted, the shell splits the assignment and NODE_EXTRA_CA_CERTS ends
+    // up holding half a path, which fails much later as a TLS error with no
+    // clue pointing back here.
+    const command = target("qoder", "subscription").command;
+    const assignment = command.slice(0, -" qodercli".length);
+    const serialized = execFileSync(
+      "/bin/sh",
+      [
+        "-c",
+        `${assignment} node -e 'process.stdout.write(process.env.NODE_EXTRA_CA_CERTS)'`,
+      ],
+      { encoding: "utf8" }
+    );
+    expect(serialized).toBe(CA_CERT_PATH);
+  });
+
+  it("uses PowerShell $env: syntax on win32, like every other route", () => {
+    const win = resolveChoice(SUBSCRIPTION, {
+      port: 8787,
+      platform: "win32" as NodeJS.Platform,
+    });
+    expect(win.kind === "target" && win.command).toBe(
+      "$env:HTTPS_PROXY = 'http://127.0.0.1:8787'; " +
+        `$env:NODE_EXTRA_CA_CERTS = '${CA_CERT_PATH}'; qodercli`
+    );
+  });
+
+  it("writes no setup file, because the two variables are the whole configuration", () => {
+    // Qoder's own docs say not to hand-edit its settings file, and this route
+    // does not need one anyway: nothing about it is stored, so stopping the
+    // command is the whole of switching it back off.
+    expect(target("qoder", "subscription").setup).toEqual([]);
+  });
+
+  it("says the route needs no base URL and no API key", () => {
+    const notes = target("qoder", "subscription").notes.join("\n");
+    expect(notes).toContain("no base URL");
+    expect(notes).toContain("no API key");
+    expect(notes).toContain("HTTPS_PROXY");
+    expect(notes).toContain("NODE_EXTRA_CA_CERTS");
+  });
+
+  it("warns that this is a man-in-the-middle, and says what that costs", () => {
+    // The one route in the catalogue that has to end the agent's TLS
+    // connection to read it. Nothing about that is discoverable from a
+    // capture, so it is said up front: what it needs (openssl, a CA), where
+    // the CA lives, how long it lives for, and that the system trust store
+    // is never touched.
+    const warning = target("qoder", "subscription").warnings.find((w) =>
+      w.includes("man-in-the-middle")
+    );
+    expect(warning).toBeDefined();
+    expect(warning).toContain("openssl");
+    expect(warning).toContain("request-logger/.mitm/");
+    expect(warning).toContain("gitignored");
+    expect(warning).toContain("deleted when this proxy stops");
+    expect(warning).toContain("system trust store is never changed");
+  });
+
+  it("warns that every HTTPS call qodercli makes arrives here, not just the model one", () => {
+    const warning = target("qoder", "subscription").warnings.find((w) =>
+      w.includes("*all*")
+    );
+    expect(warning).toBeDefined();
+    // And what becomes of the ones that are not the model call — which is not
+    // "all of them are read". Decrypting a tunnel belonging to one of the TLS
+    // clients that ignores NODE_EXTRA_CA_CERTS just breaks it.
+    expect(warning).toContain("passes through unread");
+    expect(warning).toContain("NODE_EXTRA_CA_CERTS");
+    expect(warning).toContain("forwarded");
+    expect(warning).toContain("Only the inference calls");
+  });
+
+  it("warns that Qoder encodes the body, and that this tool decodes it", () => {
+    // A Qoder update can change the scheme, and the failure has to be loud.
+    // The warning is where a student learns that the decoder is a reversed
+    // private format rather than something guaranteed to them.
+    const warning = target("qoder", "subscription").warnings.find((w) =>
+      w.includes("encodes this route's request body")
+    );
+    expect(warning).toBeDefined();
+    expect(warning).toContain("qoder-codec.ts");
+    expect(warning).toContain("loudly");
+  });
+
+  it("carries none of the BYOK gate warnings, which do not apply to this route", () => {
+    const warnings = target("qoder", "subscription").warnings.join("\n");
+    expect(warnings).not.toContain("custom_providers");
+  });
+
+  it("refuses a stale choice naming one of the BYOK templates", () => {
+    // Saved before those two entries became templates. Resolving one would
+    // produce a target with no upstream host, which forwards nowhere and
+    // looks like a hung agent, so it says what to pick instead.
+    const result = resolveChoice({ agent: "qoder", provider: "anthropic" }, PORT);
+    expect(result.kind).toBe("error");
+    expect(result.kind === "error" && result.message).toContain("--force");
+    expect(result.kind === "error" && result.message).toContain("subscription");
+  });
+
+  it("refuses Qoder with no provider chosen at all", () => {
+    const result = resolveChoice({ agent: "qoder" }, PORT);
+    expect(result.kind).toBe("error");
+    expect(result.kind === "error" && result.message).toContain("--force");
+  });
+});
+
+/** Qoder's BYOK route, reached through the "Custom base URL" option. */
+function qoderByok(customBaseUrl: string, customRenderer: RendererId) {
+  return customTarget({
+    agent: "qoder",
+    provider: CUSTOM_ID,
+    customBaseUrl,
+    customRenderer,
+  });
+}
+
+describe("resolveChoice — Qoder BYOK", () => {
+  it("resolves from a base URL and a wire format", () => {
     const result = resolveChoice(
       {
         agent: "qoder",
+        provider: CUSTOM_ID,
         customBaseUrl: "https://api.anthropic.com",
         customRenderer: "anthropic",
       },
@@ -1656,12 +1909,12 @@ describe("resolveChoice — Qoder", () => {
   });
 
   it("gives Qoder its own bin, with no env vars", () => {
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
-    expect(result.command).toBe("qodercli");
+    // Nothing to route: this call goes straight to the base URL the student
+    // typed, so the command is the bare binary and the base URL travels as a
+    // note instead.
+    expect(qoderByok("https://api.anthropic.com", "anthropic").command).toBe(
+      "qodercli"
+    );
   });
 
   it("writes no setup file, because Qoder's own docs say not to hand-edit its settings", () => {
@@ -1669,36 +1922,24 @@ describe("resolveChoice — Qoder", () => {
     // provider is created by qodercli's own /model → Custom wizard. A setup
     // file here would tell the student to do the one thing Qoder tells them
     // not to, so the base URL travels as a note instead.
-    const anthropic = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
-    const openai = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.openai.com/v1",
-      customRenderer: "openai",
-    });
-    expect(anthropic.setup).toHaveLength(0);
-    expect(openai.setup).toHaveLength(0);
+    expect(
+      qoderByok("https://api.anthropic.com", "anthropic").setup
+    ).toHaveLength(0);
+    expect(qoderByok("https://api.openai.com/v1", "openai").setup).toHaveLength(
+      0
+    );
   });
 
   it("prints a bare base URL for the anthropic route, which Qoder appends /v1/messages to", () => {
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
-    expect(result.baseUrl).toBe("http://localhost:8787");
+    expect(qoderByok("https://api.anthropic.com", "anthropic").baseUrl).toBe(
+      "http://localhost:8787"
+    );
   });
 
   it("prints a /v1 base URL for the openai route, which Qoder appends only /chat/completions to", () => {
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.openai.com/v1",
-      customRenderer: "openai",
-    });
-    expect(result.baseUrl).toBe("http://localhost:8787/v1");
+    expect(qoderByok("https://api.openai.com/v1", "openai").baseUrl).toBe(
+      "http://localhost:8787/v1"
+    );
   });
 
   it("defaults Qoder's raw/not-sure custom target to the /v1 OpenAI template", () => {
@@ -1706,26 +1947,30 @@ describe("resolveChoice — Qoder", () => {
     // is far more often OpenAI-compatible than Anthropic-compatible. Getting
     // this wrong is a doubled or missing /v1, which surfaces as a 404 with no
     // explanation, so the suffix is pinned rather than left to the renderer.
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "http://localhost:11434",
-      customRenderer: "raw",
-    });
-    expect(result.baseUrl).toBe("http://localhost:8787/v1");
+    expect(qoderByok("http://localhost:11434", "raw").baseUrl).toBe(
+      "http://localhost:8787/v1"
+    );
+  });
+
+  it("picks between the two templates by wire format, now that a third entry leads them", () => {
+    // The subscription provider sits ahead of both in the catalogue and is
+    // deliberately untagged: borrowing its HTTPS_PROXY command for an
+    // unrelated third-party server would silently misconfigure it. So
+    // findCustomTemplate has to look past it, which it does by tag.
+    expect(qoderByok("https://api.anthropic.com", "anthropic").command).toBe(
+      "qodercli"
+    );
+    expect(qoderByok("http://localhost:11434", "raw").baseUrl).toBe(
+      "http://localhost:8787/v1"
+    );
   });
 
   it("tells the student which protocol to pick, and not to add /v1 themselves on the anthropic route", () => {
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
-    expect(result.notes.some((note) => note.includes("/model"))).toBe(true);
-    expect(result.notes.some((note) => note.includes("anthropic"))).toBe(true);
-    expect(result.notes.some((note) => note.includes("/v1/messages"))).toBe(
-      true
-    );
-    expect(result.notes.some((note) => note.includes("no /v1"))).toBe(true);
+    const notes = qoderByok("https://api.anthropic.com", "anthropic").notes;
+    expect(notes.some((note) => note.includes("/model"))).toBe(true);
+    expect(notes.some((note) => note.includes("anthropic"))).toBe(true);
+    expect(notes.some((note) => note.includes("/v1/messages"))).toBe(true);
+    expect(notes.some((note) => note.includes("no /v1"))).toBe(true);
   });
 
   it("spells the base URL out in the note, because nothing else carries it", () => {
@@ -1735,112 +1980,62 @@ describe("resolveChoice — Qoder", () => {
     // neither, because its base URL goes into qodercli's own /model wizard by
     // hand. The note is the only place left to say it, and saying it wrong is
     // the doubled-or-missing /v1 404 the suffix field exists to prevent.
-    const anthropic = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
-    const openai = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.openai.com/v1",
-      customRenderer: "openai",
-    });
-    expect(anthropic.notes.join("\n")).toContain(
+    expect(qoderByok("https://api.anthropic.com", "anthropic").notes.join("\n")).toContain(
       "paste this base URL: http://localhost:8787 —"
     );
-    expect(openai.notes.join("\n")).toContain(
+    expect(qoderByok("https://api.openai.com/v1", "openai").notes.join("\n")).toContain(
       "paste this base URL: http://localhost:8787/v1."
     );
   });
 
   it("fills the note's placeholder rather than printing it", () => {
     for (const renderer of ["anthropic", "openai", "raw"] as const) {
-      const result = customTarget({
-        agent: "qoder",
-        customBaseUrl: "http://localhost:11434",
-        customRenderer: renderer,
-      });
+      const result = qoderByok("http://localhost:11434", renderer);
       expect(result.notes.join("\n")).not.toContain("{baseUrl}");
     }
   });
 
   it("warns that Qoder's BYOK route is behind a server-side feature gate", () => {
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
-    expect(
-      result.warnings.some((warning) => warning.includes("custom_providers"))
-    ).toBe(true);
-  });
-
-  it("warns that Qoder's default subscription route cannot be logged", () => {
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
+    const result = qoderByok("https://api.anthropic.com", "anthropic");
     expect(
       result.warnings.some((warning) =>
-        warning.includes("default subscription route cannot be logged")
+        warning.includes("custom_providers")
       )
     ).toBe(true);
   });
 
-  it("says why Qoder's unloggable route is not Cursor's and Amp's reason", () => {
-    // The whole point of the warning. Cursor and Amp build the system prompt
-    // server-side, so it never crosses the wire and no proxy could ever read
-    // it. Qoder builds it locally and does send it — it encodes the body
-    // first. A student who conflates the two draws the wrong conclusion about
-    // what a proxy can and cannot show them.
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
+  it("points a gated account at the subscription route instead of leaving it stuck", () => {
+    // The gate is checked against Qoder's servers on every start, so nothing
+    // the student writes locally can open it. The only useful thing the
+    // warning can do after saying that is name the route that needs no gate.
+    const result = qoderByok("https://api.anthropic.com", "anthropic");
     const warning = result.warnings.find((w) =>
-      w.includes("default subscription route cannot be logged")
+      w.includes("custom_providers")
     );
-    expect(warning).toBeDefined();
-    expect(warning).toContain("on your machine");
-    expect(warning).toContain("WASM");
-    expect(warning).toContain("Cursor and Amp");
-    expect(warning).toContain("no base-URL override");
+    expect(warning).toContain("subscription route");
   });
 
-  it("carries both warnings on either route, since neither depends on the protocol chosen", () => {
-    const openai = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.openai.com/v1",
-      customRenderer: "openai",
-    });
-    expect(openai.warnings).toHaveLength(2);
+  it("carries that one warning on either protocol, since the gate does not depend on it", () => {
+    expect(qoderByok("https://api.openai.com/v1", "openai").warnings).toHaveLength(1);
+  });
+
+  it("carries none of the subscription route's MITM warnings", () => {
+    // This call never goes through the man-in-the-middle, so warning about
+    // certificates and encoded bodies here would be noise at best.
+    const warnings = qoderByok("https://api.anthropic.com", "anthropic").warnings.join("\n");
+    expect(warnings).not.toContain("man-in-the-middle");
+    expect(warnings).not.toContain("NODE_EXTRA_CA_CERTS");
   });
 
   it("forwards to the provider the student named, not to any Qoder host", () => {
-    const result = customTarget({
-      agent: "qoder",
-      customBaseUrl: "https://api.anthropic.com",
-      customRenderer: "anthropic",
-    });
-    expect(result.upstreamBaseUrl).toBe("https://api.anthropic.com");
+    expect(
+      qoderByok("https://api.anthropic.com", "anthropic").upstreamBaseUrl
+    ).toBe("https://api.anthropic.com");
   });
 
-  it("still resolves Qoder even when the saved provider field is stale", () => {
-    const result = resolveChoice(
-      {
-        agent: "qoder",
-        provider: "whatever-was-saved-before",
-        customBaseUrl: "https://api.anthropic.com",
-        customRenderer: "raw",
-      },
-      PORT
-    );
-    expect(result.kind).toBe("custom-target");
-  });
-
-  it("rejects Qoder with no base URL", () => {
-    expect(resolveChoice({ agent: "qoder" }, PORT).kind).toBe("error");
+  it("rejects the BYOK route with no base URL", () => {
+    expect(
+      resolveChoice({ agent: "qoder", provider: CUSTOM_ID }, PORT).kind
+    ).toBe("error");
   });
 });

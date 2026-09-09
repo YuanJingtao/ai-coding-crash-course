@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { styleText } from "node:util";
 import { renderMarkdown } from "./render";
 import {
+  isMitmTarget,
   resolveChoice,
   shouldLogRequest,
   type AgentChoice,
@@ -32,6 +33,8 @@ import {
   type ResolvedTarget,
 } from "./agents";
 import { askChoice, clearChoice, loadChoice, saveChoice } from "./config";
+import { answerPlainRequest, attachMitm } from "./mitm";
+import { clearMitmDir, ensureCa } from "./certs";
 
 /**
  * A resolved target the proxy can actually route to and render: a catalogue
@@ -407,12 +410,27 @@ function field(label: string, value: string): void {
 
 function printBanner(target: ProxyTarget): void {
   const rule = dim("-".repeat(72));
-  const forwards =
-    target.kind === "target" ? `https://${target.upstreamHost}` : target.upstreamBaseUrl;
+  // A MITM target's upstreamHost is empty until a tunnel names one, so
+  // printing it would give "https://" — true of nothing, and it reads like a
+  // bug in the banner rather than a fact about the route.
+  const mitm = isMitmTarget(target);
+  const forwards = mitm
+    ? dim("each tunnel's own host, as your agent names it")
+    : target.kind === "target"
+      ? `https://${target.upstreamHost}`
+      : target.upstreamBaseUrl;
   console.log("");
   console.log(rule);
   field("Agent", bold(`${target.agentLabel} (${target.providerLabel})`));
   field("Listening", `http://localhost:${PORT}`);
+  if (mitm) {
+    field(
+      "Mode",
+      target.mitmHosts
+        ? "man-in-the-middle (CONNECT, inference hosts only)"
+        : "man-in-the-middle (CONNECT)"
+    );
+  }
   field("Forwards", forwards);
   field("Logs", dim(LOG_DIR));
   console.log(rule);
@@ -462,6 +480,45 @@ async function ask(offerToRemember: boolean): Promise<AgentChoice> {
   const { choice, remember } = await askChoice({ offerToRemember });
   if (remember) saveChoice(STATE_FILE, choice);
   return choice;
+}
+
+/**
+ * Run something on the way out, however the process leaves.
+ *
+ * An 'exit' handler on its own is not enough. Node terminates on SIGINT and
+ * SIGTERM without running exit handlers unless something listens for those
+ * signals — and once something does, the default termination is suppressed and
+ * has to be done by hand. Ctrl+C is how this tool is normally stopped, so that
+ * is the case that actually decides whether the cleanup runs.
+ *
+ * The cleanup is called with no arguments, always. Node hands an 'exit'
+ * listener the exit code, so registering one directly passes that number in,
+ * and a cleanup whose first parameter is optional reads it as its argument:
+ * `onExit(clearMitmDir)` reached `fs.rmSync(143)` and crashed on the way out of
+ * a live SIGTERM, after the cleanup had already succeeded. The same wrapper is
+ * what stops a signal and the exit it causes from cleaning up twice.
+ */
+export function onExit(
+  cleanup: () => void,
+  proc: NodeJS.Process = process
+): void {
+  let done = false;
+  const run = () => {
+    if (done) return;
+    done = true;
+    cleanup();
+  };
+  proc.once("exit", () => run());
+  const signals: Array<[NodeJS.Signals, number]> = [
+    ["SIGINT", 130],
+    ["SIGTERM", 143],
+  ];
+  for (const [signal, code] of signals) {
+    proc.once(signal, () => {
+      run();
+      proc.exit(code);
+    });
+  }
 }
 
 async function main(): Promise<void> {
@@ -543,6 +600,39 @@ async function main(): Promise<void> {
   }
 
   const target = resolution;
+
+  if (isMitmTarget(target)) {
+    // The CA has to exist before the banner is printed: the command in it
+    // names the CA's path, and the agent is started by hand afterwards.
+    // A previous run killed in a way no exit handler saw can leave one
+    // behind, so this starts from nothing rather than reusing key material
+    // it did not just create.
+    clearMitmDir();
+    try {
+      ensureCa();
+    } catch (err) {
+      console.error("");
+      console.error(`[request-logger] ${(err as Error).message}`);
+      process.exit(1);
+    }
+    onExit(clearMitmDir);
+
+    // Two halves of one mode. CONNECT is attached below; this is everything
+    // else, a plain request, which is either forwarded unread to the host it
+    // named or refused with a reason. Neither path reaches handle, so neither
+    // is written to the logs folder.
+    const tunnelServer = http.createServer(answerPlainRequest);
+    tunnelServer.on("upgrade", rejectUpgrade);
+    attachMitm(tunnelServer, target, {
+      onRequest: handle,
+      onUpgrade: rejectUpgrade,
+    });
+    tunnelServer.listen(PORT, () => {
+      printBanner(target);
+    });
+    return;
+  }
+
   const server = http.createServer((req, res) => handle(req, res, target));
   server.on("upgrade", rejectUpgrade);
   server.listen(PORT, () => {

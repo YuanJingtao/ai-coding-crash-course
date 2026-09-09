@@ -17,6 +17,7 @@ vi.mock("@clack/prompts", () => promptMocks);
 vi.mock("./model-discovery", () => discoveryMocks);
 
 import { askChoice } from "./config";
+import { CUSTOM_ID, OTHER_ID } from "./agents";
 
 function customOpenCodeAnswers() {
   promptMocks.select.mockResolvedValueOnce("opencode");
@@ -234,5 +235,44 @@ describe("the Pi custom-target model step", () => {
 
     expect(discoveryMocks.discoverModelIds).not.toHaveBeenCalled();
     expect(answer.choice.customModel).toBeUndefined();
+  });
+});
+
+describe("the Qoder provider step", () => {
+  // Qoder's catalogue entry holds three providers, but two of them are
+  // templateOnly: they exist so the custom-base-url route can borrow their bin
+  // and their notes, and neither has an upstream host to send anything to. So
+  // the student is offered one real route plus the two generic escapes.
+  it("offers the subscription route and the two generic escapes, never the templates", async () => {
+    promptMocks.select.mockResolvedValueOnce("qoder");
+    promptMocks.select.mockImplementationOnce(async (options) => {
+      const values = options.options.map(
+        (option: { value: string }) => option.value
+      );
+      expect(values).toEqual(["subscription", CUSTOM_ID, OTHER_ID]);
+      return "subscription";
+    });
+
+    const answer = await askChoice({ offerToRemember: false });
+
+    expect(answer.choice).toEqual({ agent: "qoder", provider: "subscription" });
+  });
+
+  it("still reaches Qoder's BYOK route, through Custom base URL", async () => {
+    promptMocks.select.mockResolvedValueOnce("qoder");
+    promptMocks.select.mockResolvedValueOnce(CUSTOM_ID);
+    promptMocks.text.mockResolvedValueOnce("http://localhost:8787");
+    promptMocks.select.mockResolvedValueOnce("anthropic");
+
+    const answer = await askChoice({ offerToRemember: false });
+
+    expect(answer.choice).toEqual({
+      agent: "qoder",
+      provider: CUSTOM_ID,
+      customBaseUrl: "http://localhost:8787",
+      customRenderer: "anthropic",
+      customModel: undefined,
+    });
+    expect(discoveryMocks.discoverModelIds).not.toHaveBeenCalled();
   });
 });

@@ -21,7 +21,12 @@
  * resolveCustomTarget below.
  */
 
-export type RendererId = "anthropic" | "openai" | "gemini" | "raw";
+// The one fact this catalogue cannot state for itself: where certs.ts writes
+// the CA that MITM mode needs, which the printed command has to name. Path
+// arithmetic only — importing this touches no disk. See placeholderValues.
+import { CA_CERT_PATH } from "./certs";
+
+export type RendererId = "anthropic" | "openai" | "gemini" | "qoder" | "raw";
 
 /**
  * What the student picked. This, and only this, is what gets saved to disk —
@@ -49,7 +54,7 @@ export interface ResolvedTarget {
   agentLabel: string;
   provider: string;
   providerLabel: string;
-  /** The single host every request is forwarded to. */
+  /** The single host every request is forwarded to — unless `mitm` is set. */
   upstreamHost: string;
   renderer: RendererId;
   /** The base URL the student points their agent at, e.g. http://localhost:8787/v1 */
@@ -62,6 +67,33 @@ export interface ResolvedTarget {
   notes: string[];
   /** Things that will otherwise look like the tool is broken. */
   warnings: string[];
+  /**
+   * True when the agent is not pointed at this proxy by base URL but by
+   * HTTPS_PROXY, so it sends CONNECT for whatever host it wants and the
+   * upstream is only known once that connection opens.
+   *
+   * Qoder's subscription route is the one entry that needs this: it elects
+   * its own host at runtime and offers no way to override it. mitm.ts
+   * therefore clones this target per connection with the real host filled
+   * in, which keeps `upstreamHost` honest for every later reader — handle,
+   * writeCapture and the banner all still see one host per target.
+   *
+   * `baseUrl` is meaningless here and `upstreamHost` starts empty: nothing
+   * connects to a URL, so neither is ever read as-is.
+   */
+  mitm?: boolean;
+  /**
+   * Which hosts a MITM run decrypts. A CONNECT for any other host is joined
+   * straight to the host it named and passed through unread.
+   *
+   * Optional, and absent means "all of them": an agent whose inference host
+   * cannot be predicted has to have every tunnel terminated, or nothing it
+   * says is ever logged. Qoder's can be predicted, and decrypting a tunnel
+   * that belongs to one of the TLS clients in qodercli which ignores
+   * NODE_EXTRA_CA_CERTS only breaks that call — so it names the hosts a model
+   * call can be on. See the subscription provider and mitm.ts.
+   */
+  mitmHosts?: RegExp;
 }
 
 /**
@@ -121,6 +153,28 @@ export interface SetupRequest {
 
 export type Resolution =
   ResolvedTarget | CustomTarget | AgentRefusal | ResolveError | SetupRequest;
+
+/**
+ * Whether this target's upstream is discovered per TLS connection instead of
+ * being fixed by the catalogue — the one thing proxy.ts has to know before it
+ * can decide how to listen.
+ *
+ * A guard rather than a field read because a CustomTarget has no `mitm` field
+ * at all, so `target.mitm` does not type-check against the union. It also
+ * could not mean anything there: a custom base URL is a URL the student typed
+ * and their agent calls directly, which is a plain reverse proxy by
+ * definition. Only a catalogue entry can say its agent picks its own host.
+ *
+ * The narrowed type keeps `mitm: true` rather than widening to the whole
+ * ResolvedTarget. A caller that tests this and then falls through to the
+ * ordinary-target case needs the rest of ResolvedTarget to still be there in
+ * that branch, and naming only the subset this proves leaves it there.
+ */
+export function isMitmTarget(
+  target: Resolution
+): target is ResolvedTarget & { mitm: true } {
+  return target.kind === "target" && target.mitm === true;
+}
 
 /**
  * The last option in both questions.
@@ -207,6 +261,37 @@ interface ProviderEntry {
    * would silently misconfigure it rather than help.
    */
   customTemplateFor?: RendererId[];
+  /**
+   * True when this provider's traffic arrives as TLS CONNECT rather than as
+   * requests to a base URL the student was given — the agent picks its own
+   * upstream host and this tool has to sit in the middle to see anything at
+   * all. Copied onto the ResolvedTarget; see ResolvedTarget.mitm and mitm.ts.
+   *
+   * Such a provider's `upstreamHost` is empty on purpose, and its `env` is
+   * what makes it work: HTTPS_PROXY to route the agent here, plus the CA
+   * certificate that lets it trust this proxy's freshly minted leaf.
+   */
+  mitm?: boolean;
+  /**
+   * Which hosts a MITM provider decrypts; a CONNECT for any other host is
+   * joined straight to the host it named and passed through unread. Copied
+   * onto the ResolvedTarget — see ResolvedTarget.mitmHosts.
+   */
+  mitmHosts?: RegExp;
+  /**
+   * True when this provider is a template rather than a choice.
+   *
+   * It exists so findCustomTemplate can hand the agent's own bin, env and
+   * notes to a custom-base-url target, which has no ProviderEntry of its
+   * own. It is never offered at the provider question and can never be
+   * resolved directly, because it has no upstream host to forward to —
+   * offering it would produce a target that silently forwards nowhere.
+   *
+   * An alwaysCustom agent needs no such flag: every one of its providers is
+   * a template, and the wizard skips the question entirely. This is for the
+   * agent that has both — one real route and one or more BYOK shapes.
+   */
+  templateOnly?: boolean;
 }
 
 interface AgentEntry {
@@ -351,25 +436,41 @@ const JUNIE_MERGE_NOTE =
   "already in that file.";
 
 /**
- * Qoder CLI (`qodercli`) reaches models two unrelated ways, and only one of
- * them can be logged.
+ * Qoder CLI (`qodercli`) reaches models two unrelated ways, and both are
+ * logged here — by two providers that share nothing but the binary.
  *
- * The BYOK route this entry covers is the ordinary shape: Qoder calls a base
- * URL you give it, in a standard wire format, with nothing between the two.
- * That is Junie's and OMP's shape, so it needs no renderer of its own — the
- * wire format the student picks at the wizard decides how the capture reads.
+ * The BYOK route is the ordinary shape: Qoder calls a base URL you give it,
+ * in a standard wire format, with nothing between the two. That is Junie's
+ * and OMP's shape, so it needs no renderer of its own — the wire format
+ * chosen at the wizard decides how the capture reads. It does sit behind a
+ * server-side feature gate, which is what QODER_GATE_WARNING is for.
  *
- * The default subscription route is the other one. It gets no entry of its
- * own, because an agent here is either supported or refused and never both,
- * and the BYOK route below does work — so the subscription route is a
- * warning on that entry instead. See QODER_DEFAULT_ROUTE_WARNING for what it
- * says, which is worth reading before assuming this entry is a gap in the
- * catalogue.
+ * The subscription route is the one this catalogue had not met before.
+ * Qoder builds its system prompt and its tool schemas on your machine and
+ * really does send them, so unlike Cursor and Amp there is nothing here
+ * that a proxy cannot in principle read. Two things still stop the obvious
+ * approach:
+ *
+ *  - It elects its own upstream host at runtime (a region lookup plus
+ *    Aliyun HTTPDNS, behind a tenant-prefixed domain) and offers no
+ *    base-URL override at all. `QODER_MODEL_SERVER_HOST` exists in the
+ *    binary but belongs to a newer transport that is gated off, so it is
+ *    never read on this route. There is therefore no URL to hand Qoder —
+ *    the only way to stand between the two is `HTTPS_PROXY`, which makes
+ *    this a man-in-the-middle rather than a reverse proxy.
+ *  - It encodes the request body before it leaves the process. That is
+ *    obfuscation, not encryption: a fixed substitution with no key, no
+ *    nonce and no MAC, derived from qodercli's own WASM module and
+ *    reversed in qoder-codec.ts. The response needs nothing of the kind —
+ *    it comes back as OpenAI-shaped JSON over SSE.
+ *
+ * Both facts are recorded in the warnings below rather than in a refusal,
+ * because neither one stops the capture from being read.
  *
  * Qoder's own docs tell you not to hand-edit its settings file for BYOK, so
- * unlike Junie there is no setup file here: the base URL goes into qodercli's
- * own /model → Custom wizard. The notes below are what make that possible,
- * since the wizard asks for a base URL and this tool is the one printing it.
+ * unlike Junie there is no setup file on either provider: the BYOK base URL
+ * goes into qodercli's own /model → Custom wizard, and the subscription
+ * route is configured entirely by the command's two variables.
  */
 const QODER_ANTHROPIC_NOTE =
   "In qodercli, run /model, choose Custom, set the protocol to anthropic and " +
@@ -396,20 +497,50 @@ const QODER_GATE_WARNING =
   "custom_providers, and its own docs put the feature on the Individual " +
   "plan. If /model shows no Custom option, your account does not have the " +
   "gate, and nothing you write into a local config file will make it " +
-  "appear — the check happens against Qoder's servers on every start.";
+  "appear — the check happens against Qoder's servers on every start. Run " +
+  "with --force and pick Qoder's subscription route instead if yours is " +
+  "gated: that one needs no gate, and no base URL either.";
 
-const QODER_DEFAULT_ROUTE_WARNING =
-  "Qoder's default subscription route cannot be logged, for a reason this " +
-  "catalogue had not met before and that is worth understanding. Cursor and " +
-  "Amp build their system prompt on their own servers, so no proxy can ever " +
-  "read it. Qoder builds its prompt and its tool schemas on your machine and " +
-  "really does send them — but it passes the request body through an encoder " +
-  "in a WASM module first, so what crosses the wire is not readable, and the " +
-  "route offers no base-URL override to redirect it with. Verified against " +
-  "qodercli 1.1.47 by intercepting its TLS traffic: the response came back " +
-  "as plain OpenAI-shaped JSON, while the request arrived as 285 KB of " +
-  "deterministic, high-entropy data over a 65-symbol printable alphabet. " +
-  "This is a limit of this tool, not a property of Qoder's product.";
+const QODER_SUBSCRIPTION_NOTE =
+  "This route needs no base URL and no API key from you. qodercli keeps its " +
+  "own login and picks its own server at runtime, so the two variables above " +
+  "are what point it here instead: HTTPS_PROXY sends its traffic to this " +
+  "proxy, and NODE_EXTRA_CA_CERTS lets it trust the certificate this proxy " +
+  "then has to present. Both are set for that one command only — your normal " +
+  "qodercli, in any other terminal, is untouched.";
+
+const QODER_MITM_WARNING =
+  "This is a man-in-the-middle, which no other route in this catalogue is. " +
+  "To read a request this proxy has to end qodercli's TLS connection itself " +
+  "and open a second one to Qoder, so it mints a certificate for each host it " +
+  "decrypts as that connection opens. Minting one needs `openssl` on your " +
+  "PATH, and it needs a CA: both are written under request-logger/.mitm/, " +
+  "both are gitignored, and both are deleted when this proxy stops. " +
+  "NODE_EXTRA_CA_CERTS is read by that one qodercli process and by nothing " +
+  "else — your system trust store is never changed. Setting HTTPS_PROXY also " +
+  "makes qodercli drop its gRPC transport for plain HTTP, which it does on " +
+  "purpose and logs; that is the transport this route reads anyway.";
+
+const QODER_MITM_TRAFFIC_WARNING =
+  "HTTPS_PROXY sends *all* of qodercli's HTTPS traffic through here, not " +
+  "just the model call: sign-in, telemetry, codebase indexing, downloads and " +
+  "the region lookup that elects the host all arrive too. This proxy decrypts " +
+  "only the hosts a model call can be on. Every other tunnel is joined " +
+  "straight to the host it named and passes through unread, so those calls " +
+  "reach Qoder exactly as they would have without this tool — which matters " +
+  "because qodercli holds more than one TLS client, and not all of them read " +
+  "NODE_EXTRA_CA_CERTS. Inside a decrypted tunnel, the calls that are not " +
+  "inference are forwarded untouched and reported as housekeeping. Only the " +
+  "inference calls are written to your logs folder.";
+
+const QODER_ENCODER_WARNING =
+  "Qoder encodes this route's request body before it leaves the process. " +
+  "This tool decodes it with the scheme reversed from qodercli's own WASM " +
+  "module (see qoder-codec.ts), verified byte-for-byte against 1.1.45, " +
+  "1.1.46 and 1.1.47. It is a fixed substitution with no key rather than " +
+  "encryption, but it is Qoder's to change — and a Qoder update that does " +
+  "makes every capture say so loudly at the top, rather than quietly " +
+  "showing you gibberish.";
 
 /**
  * Antigravity CLI (`agy`) is a separate Google product from Gemini CLI — a
@@ -903,40 +1034,72 @@ const AGENTS: AgentEntry[] = [
   {
     id: "qoder",
     label: "Qoder",
-    // Qoder is BYOK across whichever provider the student names, with no
-    // fixed host of its own — the same shape as Junie and OMP — so every
-    // setup for it is custom too. See AgentEntry.alwaysCustom, and the
-    // Qoder comment above the notes for why its other route is not here.
+    // Not alwaysCustom, unlike Junie and OMP: the subscription route below is
+    // a real catalogue provider, with a real renderer and a real command, so
+    // the wizard offers it directly. The two BYOK entries after it are
+    // templates only — see templateOnly — reached through the "Custom base
+    // URL" option every supported agent already offers.
     //
-    // Verified against qodercli 1.1.47 by intercepting its TLS traffic, but
-    // only as far as the wire format its BYOK config accepts: the account
-    // this was researched on has the custom_providers gate switched off, so
-    // the BYOK route itself was never driven end to end. Testing status is
-    // recorded in the README's "How much this was tested" section, the same
-    // way every other agent's is.
-    alwaysCustom: true,
+    // Verified against qodercli 1.1.45/46/47. The subscription route was
+    // driven end to end by intercepting its TLS traffic, and its body encoder
+    // was checked byte-for-byte against the WASM module that produces it. The
+    // BYOK route was verified only as far as the config schema it accepts:
+    // the account this was researched on has the custom_providers gate
+    // switched off. Testing status is recorded in the README's "How much this
+    // was tested" section, the same way every other agent's is.
     providers: [
+      {
+        id: "subscription",
+        label: "Qoder subscription (default)",
+        // Empty on purpose. This route elects its own host at runtime and
+        // offers no override, so the real host is only known once qodercli
+        // sends CONNECT — mitm.ts fills it in per connection. See
+        // ResolvedTarget.mitm.
+        upstreamHost: "",
+        renderer: "qoder",
+        bin: "qodercli",
+        mitm: true,
+        // The only shape a model call has ever been seen on: qodercli names its
+        // inference server `<tenant>-api.<apex>`, the apex being whichever of
+        // these the region lookup elected. Everything else it dials is left
+        // alone — `center` and `openapi` for sign-in and feature gates, `api3`
+        // and `api5` for the region lookup itself, OSS for downloads, and third
+        // parties for MCP servers and npm. Those arrive on tunnels owned by TLS
+        // clients that do not all read NODE_EXTRA_CA_CERTS, so decrypting them
+        // breaks calls that carry nothing worth reading.
+        mitmHosts: /^[^.]+-api\.qoder\.(xin|sh|com\.cn|com|ai)$/i,
+        env: [
+          ["HTTPS_PROXY", "{proxyUrl}"],
+          ["NODE_EXTRA_CA_CERTS", "{caPath}"],
+        ],
+        notes: [QODER_SUBSCRIPTION_NOTE],
+        warnings: [
+          QODER_MITM_WARNING,
+          QODER_MITM_TRAFFIC_WARNING,
+          QODER_ENCODER_WARNING,
+        ],
+      },
       {
         id: "anthropic",
         label: "Anthropic-compatible",
-        // Unused: Qoder never reaches the normal (non-custom) resolution
-        // path that would read this. See resolveCustomTarget.
+        // Unused: a template is never resolved directly. See templateOnly and
+        // resolveCustomTarget.
         upstreamHost: "",
         renderer: "raw",
         bin: "qodercli",
+        templateOnly: true,
         customTemplateFor: ["anthropic"],
         notes: [QODER_ANTHROPIC_NOTE],
-        warnings: [QODER_GATE_WARNING, QODER_DEFAULT_ROUTE_WARNING],
+        warnings: [QODER_GATE_WARNING],
       },
       {
         id: "openai",
         label: "OpenAI-compatible",
-        // Unused, same as the Anthropic-compatible entry above: Qoder never
-        // reaches the normal (non-custom) resolution path that would read
-        // this. See resolveCustomTarget.
+        // Unused, same as the Anthropic-compatible entry above.
         upstreamHost: "",
         renderer: "raw",
         bin: "qodercli",
+        templateOnly: true,
         // Also the catch-all for "raw"/not sure — see the OpenCode, Pi and
         // Junie entries above for why an OpenAI-compatible guess is the
         // better default for an unidentified custom server.
@@ -945,7 +1108,7 @@ const AGENTS: AgentEntry[] = [
         // so the /v1 has to already be on the base URL this prints.
         suffix: "/v1",
         notes: [QODER_OPENAI_NOTE],
-        warnings: [QODER_GATE_WARNING, QODER_DEFAULT_ROUTE_WARNING],
+        warnings: [QODER_GATE_WARNING],
       },
     ],
   },
@@ -998,13 +1161,27 @@ export function listAgents(): AgentSummary[] {
     // agent with more than one, so this used to be true by coincidence for
     // every alwaysCustom agent (OMP has exactly one provider); it is
     // spelled out here now that a second one exists.
-    needsProvider: !agent.alwaysCustom && (agent.providers?.length ?? 0) > 1,
+    //
+    // Templates are excluded from the count for every agent, not just
+    // alwaysCustom ones: they are not providers to choose between, and
+    // counting them would say Qoder has three when it has one.
+    needsProvider: !agent.alwaysCustom && visibleProviders(agent).length > 1,
     alwaysCustom: agent.alwaysCustom === true,
   }));
   return [
     ...summaries.filter((agent) => agent.supported),
     ...summaries.filter((agent) => !agent.supported),
   ];
+}
+
+/**
+ * The providers a student can actually pick. Drops the templates, which
+ * exist to shape a custom target and would otherwise be offered as choices
+ * that resolve to a target with no upstream host. See ProviderEntry.
+ * templateOnly.
+ */
+function visibleProviders(agent: AgentEntry | undefined): ProviderEntry[] {
+  return (agent?.providers ?? []).filter((p) => p.templateOnly !== true);
 }
 
 /**
@@ -1019,12 +1196,14 @@ export function listAgents(): AgentSummary[] {
  */
 export function listProviders(agentId: string): ProviderSummary[] {
   const agent = AGENTS.find((a) => a.id === agentId);
-  if (!agent?.providers || agent.providers.length < 2) return [];
-  return agent.providers.map((p) => ({ id: p.id, label: p.label }));
+  const providers = visibleProviders(agent);
+  if (providers.length < 2) return [];
+  return providers.map((p) => ({ id: p.id, label: p.label }));
 }
 
 /**
- * Every catalogue provider for one agent, regardless of how many there are.
+ * Every provider one agent offers at the wizard, regardless of how many
+ * there are — which is every catalogue provider except the templates.
  *
  * config.ts uses this, not listProviders, to build the provider question's
  * options — because "Custom base URL" is now offered at that question for
@@ -1034,7 +1213,7 @@ export function listProviders(agentId: string): ProviderSummary[] {
  */
 export function agentProviders(agentId: string): ProviderSummary[] {
   const agent = AGENTS.find((a) => a.id === agentId);
-  return (agent?.providers ?? []).map((p) => ({ id: p.id, label: p.label }));
+  return visibleProviders(agent).map((p) => ({ id: p.id, label: p.label }));
 }
 
 // ---------------------------------------------------------------------------
@@ -1056,6 +1235,11 @@ export function agentProviders(agentId: string): ProviderSummary[] {
  *  - Gemini counts tokens under a different name, and on the Google login route
  *    it fires several calls that carry no prompt at all. On that route the only
  *    calls worth keeping are the ones that generate content.
+ *  - Qoder's subscription route is that case taken further. It arrives over
+ *    MITM, so what this sees is not one agent's model traffic but every HTTPS
+ *    call the whole process makes — sign-in, telemetry, codebase indexing, the
+ *    region lookup that elects the host. A blacklist cannot describe that, so
+ *    this is a whitelist of the two paths that actually carry a prompt.
  */
 export function shouldLogRequest(
   method: string,
@@ -1066,6 +1250,14 @@ export function shouldLogRequest(
   // Case-insensitive on purpose: the streaming call is `:streamGenerateContent`,
   // with a capital G, and the non-streaming one is `:generateContent`.
   if (renderer === "gemini") return /generateContent/i.test(reqPath);
+  // `agent_chat_generation` is the subscription route's inference call, under
+  // whichever tenant-prefixed host the region lookup elected. The second path
+  // is the plain-HTTP transport qodercli also carries, which posts the same
+  // request unencoded; it is not what HTTPS_PROXY selects, but it renders the
+  // same way and would otherwise be dropped as housekeeping.
+  if (renderer === "qoder") {
+    return /agent_chat_generation|\/model\/v1\/chat\/completions/.test(reqPath);
+  }
   // Matches both `count_tokens` (direct Anthropic API) and `countTokens`
   // (Claude Code on Vertex AI).
   return !/count[_-]?tokens/i.test(reqPath);
@@ -1075,12 +1267,42 @@ export function shouldLogRequest(
 // Resolution — the seam
 // ---------------------------------------------------------------------------
 
+/**
+ * The values a catalogue entry can name in `{braces}`.
+ *
+ * `port` is passed in rather than parsed back out of `baseUrl` because the
+ * two URL placeholders do not want the same string. `baseUrl` is what the
+ * agent is told to call, and carries any suffix the agent must not add
+ * itself. `proxyUrl` is what HTTPS_PROXY wants: a bare origin, and on
+ * 127.0.0.1 rather than localhost — a proxy that resolves "localhost" to ::1
+ * first is unreachable for an agent that only ever tries the IPv4 answer.
+ *
+ * `caPath` is the one placeholder not derived from anything the caller
+ * knows: it is where certs.ts writes the CA it mints, and this module
+ * imports that path rather than repeating it, so the printed command and the
+ * file on disk cannot drift apart. Reading it is path arithmetic, so
+ * resolveChoice stays pure — nothing touches the disk here.
+ *
+ * A name this does not know is left in the output rather than blanked, so a
+ * typo in a catalogue entry shows up in the printed command instead of
+ * silently vanishing from it.
+ */
+function placeholderValues(baseUrl: string, port: number): Record<string, string> {
+  return {
+    baseUrl,
+    proxyUrl: `http://127.0.0.1:${port}`,
+    caPath: CA_CERT_PATH,
+  };
+}
+
 function buildCommand(
   provider: ProviderEntry,
   baseUrl: string,
-  platform: NodeJS.Platform
+  options: { port: number; platform: NodeJS.Platform }
 ): string {
-  const fill = (text: string) => text.replace(/\{baseUrl\}/g, baseUrl);
+  const values = placeholderValues(baseUrl, options.port);
+  const fill = (text: string) =>
+    text.replace(/\{(\w+)\}/g, (whole, name: string) => values[name] ?? whole);
   const env = (provider.env ?? []).map(
     ([key, value]) => [key, fill(value)] as const
   );
@@ -1088,7 +1310,7 @@ function buildCommand(
   // whole override arrives as a flag.
   const args = (provider.args ?? []).map(fill);
   const bin = [provider.bin, ...args].join(" ");
-  return withEnv(env, bin, platform);
+  return withEnv(env, bin, options.platform);
 }
 
 /**
@@ -1115,7 +1337,28 @@ function withEnv(
       bin,
     ].join("; ");
   }
-  return [...env.map(([key, value]) => `${key}=${value}`), bin].join(" ");
+  return [
+    ...env.map(
+      ([key, value]) => `${key}=${posixSafe(value) ? value : shellQuote(value)}`
+    ),
+    bin,
+  ].join(" ");
+}
+
+/**
+ * Whether a value survives a POSIX shell unquoted.
+ *
+ * Everything this tool printed before MITM mode is a URL or a bare path, made
+ * only of characters a shell reads literally, so leaving them unquoted has
+ * always been correct — and stays correct, which matters because the printed
+ * commands are tested verbatim. An absolute path with a space in it is the
+ * first value that is not: this repo lives under whatever directory the
+ * student cloned it into. Unquoted, such a path splits into two words and the
+ * command runs with the variable set to the first half of it, which fails as
+ * a TLS error a long way from its cause.
+ */
+function posixSafe(value: string): boolean {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(value);
 }
 
 /** Quote one complete POSIX shell argument, including embedded single quotes. */
@@ -1386,7 +1629,7 @@ function resolveCustomTarget(
       upstreamBaseUrl: upstreamBaseUrlWithPath(upstream),
       renderer,
       baseUrl,
-      command: buildCommand(template, baseUrl, platform),
+      command: buildCommand(template, baseUrl, { port, platform }),
       setup: [piModels(providerId, baseUrl, model)],
       notes,
       warnings: template.warnings ?? [],
@@ -1409,7 +1652,9 @@ function resolveCustomTarget(
     upstreamBaseUrl: upstreamBaseUrlWithPath(upstream),
     renderer,
     baseUrl,
-    command: template ? buildCommand(template, baseUrl, platform) : agent.id,
+    command: template
+      ? buildCommand(template, baseUrl, { port, platform })
+      : agent.id,
     setup: (template?.setup ?? []).map((file) => ({
       ...file,
       body: file.body.replace(/\{baseUrl\}/g, baseUrl),
@@ -1473,6 +1718,15 @@ export function resolveChoice(
     return resolveCustomTarget(agent, choice, options.port, options.platform);
   }
 
+  // Templates are not resolvable: they carry no upstream host, so a target
+  // built from one would forward nowhere. A choice naming one is a stale
+  // save from before that provider became a template, and says so with the
+  // list that can actually be picked. The single-provider shortcut below is
+  // deliberately keyed on the total count, not the visible one: an agent
+  // with one real route and two templates still asks, because "Custom base
+  // URL" is a real second option there.
+  const providers = visibleProviders(agent);
+
   let provider: ProviderEntry | undefined;
   if (agent.providers.length === 1) {
     // One provider, so the wizard never asked. Ignore anything saved.
@@ -1483,22 +1737,28 @@ export function resolveChoice(
       message:
         `${agent.label} can drive more than one model provider, so a provider ` +
         `must be chosen. Run with --force to choose again. Providers: ` +
-        `${agent.providers.map((p) => p.id).join(", ")}.`,
+        `${providers.map((p) => p.id).join(", ")}.`,
     };
   } else {
-    provider = agent.providers.find((p) => p.id === choice.provider);
+    provider = providers.find((p) => p.id === choice.provider);
     if (!provider) {
       return {
         kind: "error",
         message:
           `Unknown provider "${choice.provider}" for ${agent.label}. Run with ` +
           `--force to choose again. Providers: ` +
-          `${agent.providers.map((p) => p.id).join(", ")}.`,
+          `${providers.map((p) => p.id).join(", ")}.`,
       };
     }
   }
 
-  const baseUrl = `http://localhost:${options.port}${provider.suffix ?? ""}`;
+  // A MITM route has no base URL to print. Nothing is pointed at this proxy
+  // by URL there — the agent reaches it through HTTPS_PROXY and sends
+  // CONNECT — so this is left empty rather than filled with the listening
+  // address, which would read like something to paste somewhere.
+  const baseUrl = provider.mitm
+    ? ""
+    : `http://localhost:${options.port}${provider.suffix ?? ""}`;
 
   return {
     kind: "target",
@@ -1509,7 +1769,7 @@ export function resolveChoice(
     upstreamHost: provider.upstreamHost,
     renderer: provider.renderer,
     baseUrl,
-    command: buildCommand(provider, baseUrl, options.platform),
+    command: buildCommand(provider, baseUrl, options),
     setup: (provider.setup ?? []).map((file) => ({
       ...file,
       body: file.body.replace(/\{baseUrl\}/g, baseUrl),
@@ -1518,5 +1778,7 @@ export function resolveChoice(
       note.replace(/\{baseUrl\}/g, baseUrl)
     ),
     warnings: provider.warnings ?? [],
+    mitm: provider.mitm === true,
+    mitmHosts: provider.mitmHosts,
   };
 }

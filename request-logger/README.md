@@ -115,7 +115,7 @@ from this table. It is here so you can see what is supported before you start.
 | Gemini CLI      | Yes   | One command. The free Google login works.                                                |
 | Antigravity CLI | Yes   | A config file and a real Gemini API key — see below.                                     |
 | Junie           | Yes   | A config file, and a real API key pasted in — see below.                                 |
-| Qoder           | Yes   | A BYOK custom provider, if your account has that feature — see below.                    |
+| Qoder           | Yes   | One command, for either route. The default one needs `openssl` — see below.              |
 | Cursor CLI      | No    | Nothing can make it work. See below.                                                     |
 | Amp             | No    | Nothing can make it work. See below.                                                     |
 
@@ -184,13 +184,127 @@ commit it.
 
 ### Qoder
 
-Qoder CLI (`qodercli`) reaches models two unrelated ways, and this tool can
-only log one of them.
+Qoder CLI (`qodercli`) reaches models two unrelated ways. This tool logs both,
+but the default one needs a mode nothing else in the catalogue does.
 
-The **BYOK route** is the one that works. There Qoder calls a base URL you give
-it, in a standard wire format, with nothing in between — the same shape as
-Junie and OMP, so no new renderer was needed. It goes through the base URL and
-wire format questions the way a custom target does.
+#### The default subscription route
+
+Pick **Qoder subscription (default)** and the tool prints one command:
+
+```bash
+HTTPS_PROXY=http://127.0.0.1:8787 NODE_EXTRA_CA_CERTS=…/request-logger/.mitm/ca.crt qodercli
+```
+
+Copy that whole line into a second terminal. There is no base URL to give and
+no API key to paste: you keep the Qoder login you already have, and your real
+credentials go past this tool untouched, exactly as they do for every other
+agent here.
+
+**Why this route cannot work like the others.** Everything else in this tool is
+a reverse proxy: you are handed a base URL, your agent calls it, and the host on
+the other side is known before the first request arrives. Qoder's subscription
+route has no base-URL override to hand you. It elects its own inference server
+at runtime — a region lookup, then Aliyun HTTPDNS, behind a tenant-prefixed
+domain — so there is nothing to point it at, and nowhere to stand except in the
+middle of the connection. The `QODER_*_BASE_URL` names in the shipped binary
+look like overrides and are not: they are compile-time constants, and nothing
+reads them at runtime.
+
+So this route makes the tool the proxy that `HTTPS_PROXY` names, and it answers
+the `CONNECT` that then arrives. That is a man-in-the-middle rather than a
+reverse proxy, and the difference is worth stating plainly: to read a request
+it ends Qoder's TLS connection and opens a second one upstream, which needs a
+certificate `qodercli` will trust.
+
+**What it does to your trust store: nothing.** The certificate authority is
+minted for one run and handed to `qodercli` through `NODE_EXTRA_CA_CERTS`,
+which adds it to that one process's trust store. Your system and user trust
+stores are never touched, and nothing else on the machine can see it. The CA
+lives in `request-logger/.mitm/`, is gitignored, is valid for a day, and is
+deleted when the proxy stops — including on Ctrl+C. `openssl` has to be on your
+`PATH` to mint it; that is this route's one extra requirement, and the tool says
+so before it starts listening rather than failing on the first connection.
+
+**Only the tunnels that can hold a model call are decrypted.** `qodercli` has
+more than one TLS client in it, and they do not all read
+`NODE_EXTRA_CA_CERTS`. A tunnel this tool ends for one of those clients is a
+tunnel that fails — and it fails for nothing, because the call inside it was
+never a model call. One live run, before this rule existed, had its certificate
+rejected on 24 of the 59 tunnels it opened, and not one of the 24 was carrying
+anything worth logging.
+
+So the catalogue names the hosts inference can be on. `qodercli` reaches its
+model server as `<tenant>-api.<apex>`, the apex being whichever of `qoder.xin`,
+`qoder.sh`, `qoder.com.cn`, `qoder.com` or `qoder.ai` the region lookup elected.
+Those tunnels get a certificate. Every other tunnel is joined straight to the
+host it named and carries bytes this tool never reads in either direction, which
+for that call is indistinguishable from not being proxied at all.
+
+Each tunnel prints one dim line saying which of the two happened —
+`tunnel open -> …` was decrypted, `tunnel passed through unread -> …` was not —
+so a host this rule was never told about stays visible instead of silent. A
+handshake failure on a decrypted tunnel means one of Qoder's TLS clients did not
+accept the certificate. That is only the whole run failing when _every_ tunnel
+fails and your logs folder stays empty, which is what the line says rather than
+blaming your environment on the first one.
+
+**All of Qoder's traffic passes through; most of it is not even read.**
+`HTTPS_PROXY` is not per-endpoint, so sign-in, telemetry, codebase status,
+downloads and region lookups arrive here too, and are spliced as above. The
+exception is whatever Qoder sends to the inference host itself: inside a
+decrypted tunnel every call is forwarded untouched, and only inference calls get
+a capture. The rest appear in the console as `(housekeeping, not logged)`, the
+same as a token-counting call does elsewhere. Setting the variable also makes
+Qoder's gRPC transport fall back to plain HTTP, which its own binary notes and
+which costs nothing here.
+
+**Qoder's own DNS lookup arrives differently, and is forwarded.** `qodercli`
+resolves some of its hosts through Aliyun HTTPDNS, and that client sends the
+resolver call as a plain HTTP request naming its own destination — `GET
+https://203.107.1.1/183012/ss?region=global`, scheme and all — rather than as a
+`CONNECT` with a tunnel around it. A request that says where it is going can be
+sent there, so this proxy dials that host and pipes the answer back, unread and
+unlogged: a resolver call carries no prompt. It prints `plain request passed
+through unread -> …`, the plain-request sibling of the tunnel line above.
+
+It does that for a client on this machine only. The proxy listens on every
+network interface, so answering an absolute-form request from anywhere else
+would turn it into an open proxy for your network; that one gets a 400 saying
+so. A 400 naming a _path_ rather than a whole URL is the other case, and the far
+more common one: your agent was pointed at a base URL instead of `HTTPS_PROXY`,
+and the message tells you to run `--force` and pick the route that matches.
+
+Nothing depended on the forwarding. Before it existed, `qodercli` collected a
+400, retried four rounds of seven resolvers, and fell back to your system
+resolver — which is how it found the inference host behind every number here.
+What changed is that a run no longer spends a second doing that, and no longer
+prints 28 refusals on the way.
+
+**The request body is encoded, and this tool decodes it.** The call carries
+`Encode=1` in its URL, and what crosses the wire is not the JSON that was
+built. It is not encryption, though. It is standard base64 over a private
+64-symbol alphabet with `$` as the pad, followed by a swap of the outer third
+of the characters: no key, no nonce, no MAC, and the same input always gives
+the same output. `qoder-codec.ts` holds the decoder, worked out from the WASM
+module that does the encoding, which is byte-identical across `qodercli`
+1.1.45, 1.1.46 and 1.1.47.
+
+What comes out is the whole request: the system prompt Qoder built on your
+machine, every tool definition, and your messages. The response was never
+encoded — it arrives as OpenAI-shaped JSON over SSE, and is rendered that way.
+
+The encoding is Qoder's to change, so the decoder refuses to guess. A body that
+does not decode, or that decodes to something that is not JSON, produces a
+`.md` file opening with `COULD NOT DECODE THIS BODY` followed by the bytes
+exactly as they arrived. A readable document that was never sent is the one
+thing this tool must not produce, and a Qoder release that changes the encoding
+gets that warning instead.
+
+#### The BYOK custom-provider route
+
+There Qoder calls a base URL you give it, in a standard wire format, with
+nothing in between — the same shape as Junie and OMP, so no new renderer was
+needed. Reach it with **Custom base URL** at the provider question.
 
 Unlike Junie, there is no config file for this tool to write. Qoder's own docs
 tell you not to set BYOK up by hand in its settings file, so the base URL goes
@@ -216,40 +330,8 @@ BYOK sits behind a server-side feature gate Qoder calls `custom_providers`, and
 Qoder's docs put the feature on the Individual plan. If `/model` shows no
 **Custom** option, your account does not have it, and nothing you write into a
 local config file will make it appear — the check runs against Qoder's servers
-on every start.
-
-#### Why Qoder's default route cannot be logged
-
-The **default subscription route** — the one your Qoder login uses when you have
-not set BYOK up — cannot be logged. The reason is worth understanding, because
-it is not the reason the next section gives for Cursor and Amp.
-
-It is not simply a missing base-URL override, though that part is true and it is
-what makes the route impossible to _redirect_. Qoder elects its inference host at
-runtime from its own region-endpoint service and resolves it through Aliyun's
-HTTPDNS, and the `QODER_*_BASE_URL` names that look like overrides in the
-shipped binary are compile-time constants, not environment variables — nothing
-reads them at runtime.
-
-It is not Cursor's and Amp's reason either, and this is the part that matters.
-Qoder builds its system prompt and its tool schemas **on your machine**, and
-really does send them. They go past your network card. What stops you reading
-them is that Qoder passes the request body through an encoder in a WASM module
-first, so what crosses the wire is not the JSON that was built.
-
-This was checked against `qodercli` 1.1.47 by intercepting its TLS traffic — it
-honours `HTTPS_PROXY`, and `NODE_EXTRA_CA_CERTS` adds a certificate to its trust
-store for that one process without touching your system's. The interception
-worked; the body did not become readable. The request arrived as 285 KB of
-deterministic, high-entropy data over a 65-symbol printable alphabet, on a URL
-marked `Encode=1`. That marker is deliberate and per-endpoint: the calls Qoder
-makes without it, to its own config and codebase services, arrive as plain JSON.
-The response to the encoded request, meanwhile, came back as plain
-OpenAI-shaped JSON.
-
-So a proxy can see this traffic and cannot read it. That is a limit of this
-tool, not a property of Qoder's product — which is exactly how it differs from
-Cursor and Amp, where no proxy could ever see it at all.
+on every start. Use the subscription route above instead: it needs no gate, and
+no base URL either.
 
 ### Why Cursor and Amp cannot work
 
@@ -273,8 +355,11 @@ vendor can build the prompt on your machine, send it, and still leave you
 unable to read it — by encoding the request body on the way out. Qoder's
 default route does exactly that; see [Qoder](#qoder) above. The distinction is
 not academic. The second kind is a permanent fact about the product, and no
-tool will ever read it. The third kind is a gap in this one, and a tool that
-could undo the encoding would read it fine.
+tool will ever read it. The third kind is a gap in the tool, and a tool that
+undoes the encoding reads it fine — this one does, in `qoder-codec.ts`. The
+encoding still belongs to Qoder and can change in any release, which is a
+maintenance cost rather than a wall: when it changes, the capture says so
+loudly instead of quietly showing you something that was never sent.
 
 If you use Cursor or Amp, install one of the other agents to follow the lesson.
 
@@ -324,18 +409,44 @@ to find them. Nothing is lost: it is still the whole request and response, just
 less readable. Run with `--force` and pick the real wire format once you know
 it, and the tagged render takes over from the next request.
 
-Secret headers (`authorization`, `x-api-key`, `api-key`) are hidden in the `.md`
-file and are never written to the `.txt` files.
+Secrets are hidden in the `.md` file and are never written to the `.txt` files,
+which hold no headers at all. One rule covers headers and body fields: split the
+name on `-` and `_`, and hide the value if any piece of it ends in `key`,
+`token`, `secret`, `password`, `authorization`, `credential` or `cookie`. That
+catches `x-goog-api-key` and the `cosy-key` and `cosy-machinetoken` that Qoder
+sends, and it deliberately spares `max_input_tokens` and `prompt_tokens`,
+because a token count is a number you came here to read. Body fields are covered
+at all because Qoder's subscription route sends configuration inside the request,
+which is where a BYOK `api_key` would sit.
 
-Some agents compress the request body. The `.md` file shows the decoded body so
-that you can read it. The `.request.txt` file keeps the bytes exactly as they
-were sent, so you can still replay it.
+A name is not the whole story. Qoder sends the same string as both
+`cosy-machinetoken` and `cosy-machineid`, so hiding the first by name leaves the
+second printing a credential in full. The _value_ of every secret-named header is
+therefore scrubbed from the rest of the document too, along with the credential
+inside a `Bearer` prefix — but only when it is at least 16 characters long,
+because replacing every occurrence of something shorter could rewrite what was
+actually sent, and a document that was never sent is worse than a leaked one.
+
+Some agents compress the request body, and Qoder's subscription route encodes
+its. The `.md` file shows the body with every layer this tool knows how to take
+off removed, so that you can read it. The `.request.txt` file keeps the bytes
+exactly as they were sent, so you can still replay it — for Qoder that means the
+encoded form, which is what the server on the other end actually received.
 
 ## How it works
 
 - One process, one port, **one upstream host**. Your choice decides where
   requests go and how they are read. The tool does not guess from the URL,
   because several agents share the same URLs and guessing gets them wrong.
+- The one exception is Qoder's subscription route, where the host is not in the
+  catalogue to begin with. It still is not guessed from the URL: it comes from
+  the `CONNECT` line, and each tunnel the catalogue says can hold a model call
+  gets its own copy of the target with that host filled in. A tunnel to any
+  other host is spliced straight through and read by nothing, and so is a plain
+  HTTP request that names its own destination — the shape Qoder's DNS lookup
+  arrives in. Everything downstream of a decrypted tunnel — the capture writer,
+  the burst guard, the renderer — sees one host, as always. See
+  [Qoder](#qoder).
 - Your real auth header passes through untouched, so your requests authenticate
   normally. The tool only reads a copy on the way past.
 - Responses are **streamed straight back** as they arrive, so your agent behaves
@@ -407,6 +518,23 @@ of these happened:
    read an OPENAI_BASE_URL variable. Version 0.133.0 does not. It ignores the
    variable in silence, so the only sign is an empty logs folder. Use the
    command this tool prints.
+6. **You are on Qoder's subscription route and only half the command landed.**
+   Both variables have to reach the same `qodercli` process, and the ways this
+   fails look different. Nothing in the proxy's console at all means
+   `HTTPS_PROXY` did not reach it, so it connected directly and never saw this
+   tool. A missing `NODE_EXTRA_CA_CERTS` shows up as `TLS handshake for …
+failed` on _every_ tunnel with the logs folder still empty. One such line on its
+   own is not that: `qodercli` has more than one TLS client, and a tunnel
+   decrypted for one that ignores the variable fails while the inference tunnel
+   succeeds — worth an issue, since it means a host the rule should splice is
+   being terminated instead. The same folder staying empty with _no_ failure at
+   all, and `tunnel passed through unread -> …` lines naming something shaped
+   like `<tenant>-api.<apex>`, is the rule missing the inference host: that is
+   also worth an issue, and the fix is one line in `agents.ts`. The other way to
+   get every tunnel failing is to leave an agent running across a restart of
+   this proxy: the CA is minted fresh every run, so that agent is still trusting
+   a certificate which no longer exists. Start the agent from the command the
+   banner prints, after the banner prints it.
 
 ## How much this was tested
 
@@ -433,16 +561,37 @@ Be fair to the tool when you judge a failure.
   authentication and the `GOOGLE_GEMINI_BASE_URL` variable), not against real
   source or a real install, and its account sign-in route was not verified
   at all — see "Antigravity CLI" above for why that route is left out.
-- **Qoder is verified against the real binary, but its BYOK route was never
-  driven end to end.** `qodercli` is closed source and ships as compiled
-  bytecode, so its entry was checked against the strings the binary itself
-  carries — the BYOK config schema it validates, and the three path constants
-  it appends to a base URL — plus a real TLS interception of its traffic,
-  which is where the "Why Qoder's default route cannot be logged" section
-  above gets its evidence from. The BYOK route could not be driven: the
-  account this was researched on has the `custom_providers` gate switched off,
-  so `/model` shows no Custom option to paste a base URL into. What is tested
-  is the wizard's output for it and the resolution behind that output.
+- **Qoder's subscription route is driven end to end, against real traffic.** A
+  live `qodercli` 1.1.47 run through the proxy asked a question and got its
+  answer back, and the capture holds the whole request: a 377,588-byte body
+  decoded off the wire, a 101-line system prompt, every tool definition, the
+  messages, and the streamed reply reassembled with its thinking and its usage.
+  The decoder behind that is cross-checked against the WASM module that does the
+  encoding on 452 bodies of its own, and is byte-identical across 1.1.45, 1.1.46
+  and 1.1.47.
+  The same run verified the two pass-through paths. It opened 23 tunnels,
+  decrypted the two to the inference host, spliced the other 21 unread, and
+  finished with no handshake failure at all — where an earlier run, before the
+  host rule existed, had its certificate rejected on 24 of 59. And `qodercli`
+  sent two HTTPDNS lookups, both answered, where a run before the plain-request
+  path existed collected 28 refusals and then fell back to the system resolver.
+  The forwarding tests drive `http` on an arbitrary port, with a body and
+  without one; the `https` branch the real resolver call uses is verified by
+  that live run and not by a test, which would need a TLS destination it trusts.
+  What is not tested is breadth: one machine, one account, one model, short
+  turns only. A long session through this route — many tool calls, images, a
+  compacted history — has not been driven, and `patches` and `cache_id`, the two
+  fields that would let Qoder send a reference instead of message text, never
+  appeared. Nor has the host rule met a tenant whose inference server is not
+  shaped `<tenant>-api.<apex>`. If a Qoder deployment names it differently this
+  tool splices that tunnel and logs nothing, which is why each one is announced
+  on its own line in the console.
+- **Qoder's BYOK route was never driven end to end.** The account this was
+  researched on has the `custom_providers` gate switched off, so `/model` shows
+  no Custom option to paste a base URL into. What is tested is the wizard's
+  output for that route and the resolution behind the output; the entry itself
+  was checked against the config schema the closed-source binary validates and
+  the three path constants it appends to a base URL.
 - **A custom base URL is only as tested as the agent it is attached to.** The
   base URL and wire format mechanism itself is tested directly (see
   `agents.test.ts`); a specific third-party server behind it has not
@@ -469,10 +618,36 @@ line in `agents.ts`.
   bin and a setup file. The wizard then skips the provider question for it
   entirely and asks the two custom-base-url questions directly. See the OMP
   entry in `agents.ts` for the whole shape. If the agent takes its base URL by
-  hand instead of from a file or a variable, the way Qoder's does, then nothing
-  carries the suffix — the banner's `Listening` line does not — so put
-  `{baseUrl}` in the note text, which is filled in exactly as a setup file body
-  is.
+  hand instead of from a file or a variable, the way Qoder's BYOK route does,
+  then nothing carries the suffix — the banner's `Listening` line does not — so
+  put `{baseUrl}` in the note text, which is filled in exactly as a setup file
+  body is.
+- **Add an agent whose upstream host cannot be known in advance**, the way
+  Qoder's subscription route cannot: give the provider entry no upstream host
+  and set `mitm: true`. The proxy then listens for `CONNECT` rather than for
+  requests, mints a certificate for each host it decrypts as that tunnel opens
+  (`certs.ts`), and hands the request handler a copy of your target with that
+  tunnel's host filled in — so nothing downstream of it has to know any of this
+  happened. `env` is where `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` go, and
+  `{proxyUrl}` and `{caPath}` are filled in for you the way `{baseUrl}` is.
+  `shouldLogRequest` decides what gets written down, and in this mode it is
+  load-bearing rather than tidiness: the tunnel carries every call the agent
+  makes, not just the ones to a model.
+  Not all of that traffic is a tunnel. An agent whose client sends a plain HTTP
+  request naming its own destination — Qoder's DNS client does — gets it
+  forwarded unread, for a client on this machine only, since the proxy listens
+  on every interface and would otherwise be an open one. `plainRequestPlan` in
+  `mitm.ts` is the whole rule.
+  By default every tunnel is decrypted. If your agent holds a TLS client that
+  ignores `NODE_EXTRA_CA_CERTS` — Qoder holds several — a tunnel ended for that
+  client fails, so set `mitmHosts` to a pattern matching only the hosts a model
+  call can be on. Everything else is then spliced straight to the host it named
+  and read by nothing, which leaves those calls working exactly as they were.
+- **Add a provider that is only a template**, the way Qoder's two BYOK entries
+  are: set `templateOnly: true`. It lends its bin, env, suffix and notes to a
+  custom base URL through `customTemplateFor`, and is never offered at the
+  provider question nor resolvable on its own — which is what you want for a
+  route with no host of its own to send anything to.
 - **Add a wire format:** add a renderer in `render.ts` and name it on the
   catalogue entry. Unknown shapes already fall back to pretty-printed JSON, so
   you can iterate safely.

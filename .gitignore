@@ -27,3 +27,8 @@
 # request-logger remembers which agent you chose
 /request-logger/.agent-choice.json
 
+# request-logger's throwaway MITM certificate authority. Deleted when the
+# proxy stops, but a run can be killed in a way no exit handler sees, and this
+# is a key that can sign a trusted certificate for any host.
+/request-logger/.mitm/
+

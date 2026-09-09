@@ -6,6 +6,7 @@ import {
   BURST_THRESHOLD,
   BURST_WINDOW_MS,
   burstKey,
+  onExit,
   rejectUpgrade,
   trackBurst,
   upstreamConnection,
@@ -310,5 +311,64 @@ describe("trackBurst", () => {
     const afterGap = trackBurst(state, KEY, now + BURST_WINDOW_MS + 1);
     expect(afterGap.suppressed).toBe(false);
     expect(afterGap.state.count).toBe(1);
+  });
+});
+
+describe("onExit", () => {
+  /** A stand-in for process: listeners by event, plus the exit codes asked for. */
+  function fakeProcess() {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const exits: number[] = [];
+    return {
+      exits,
+      once(event: string, listener: (...args: unknown[]) => void) {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+      },
+      exit(code: number) {
+        exits.push(code);
+      },
+      emit(event: string, ...args: unknown[]) {
+        for (const listener of listeners.get(event) ?? []) listener(...args);
+      },
+    };
+  }
+
+  const asProcess = (proc: ReturnType<typeof fakeProcess>) =>
+    proc as unknown as NodeJS.Process;
+
+  it("calls the cleanup with no arguments, not with the exit code", () => {
+    // Node hands an 'exit' listener the code. clearMitmDir's directory is an
+    // optional parameter, so registering it directly reached fs.rmSync(143) and
+    // crashed on the way out of a live SIGTERM.
+    const seen: unknown[][] = [];
+    const proc = fakeProcess();
+    onExit((...args: unknown[]) => seen.push(args), asProcess(proc));
+
+    proc.emit("exit", 143);
+
+    expect(seen).toEqual([[]]);
+  });
+
+  it("cleans up once when a signal is followed by the exit it causes", () => {
+    let calls = 0;
+    const proc = fakeProcess();
+    onExit(() => {
+      calls += 1;
+    }, asProcess(proc));
+
+    proc.emit("SIGTERM");
+    proc.emit("exit", 143);
+
+    expect(calls).toBe(1);
+    expect(proc.exits).toEqual([143]);
+  });
+
+  it("exits 130 on SIGINT, the code a shell reads as Ctrl+C", () => {
+    const proc = fakeProcess();
+    onExit(() => {}, asProcess(proc));
+
+    proc.emit("SIGINT");
+
+    expect(proc.exits).toEqual([130]);
   });
 });
