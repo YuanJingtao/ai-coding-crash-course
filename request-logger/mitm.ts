@@ -5,10 +5,9 @@
  * Everything else in this tool is a reverse proxy: the student is given a base
  * URL, their agent calls it, and the one host on the other side is known before
  * the first request arrives. Qoder's subscription route cannot work that way.
- * It elects its own server at runtime — a region lookup plus Aliyun HTTPDNS,
- * behind a tenant-prefixed domain — and offers no override, so the only way to
- * stand between the two is to be the proxy its HTTPS_PROXY names and to answer
- * the CONNECT that then arrives.
+ * It elects its own server at runtime — a region lookup plus Aliyun HTTPDNS —
+ * and offers no override, so the only way to stand between the two is to be the
+ * proxy its HTTPS_PROXY names and to answer the CONNECT that then arrives.
  *
  * That makes this a man-in-the-middle rather than a reverse proxy, and the
  * difference is not cosmetic: to read a request this has to end the agent's TLS
@@ -152,12 +151,15 @@ export function handshakeNote(message: string): string {
  *
  * `hosts` is the catalogue's answer for this agent, and it is optional: an
  * agent whose inference host cannot be predicted has to have every tunnel
- * terminated, which is what an absent pattern means. Qoder's can be predicted —
- * a live run put the model call on a single tenant-prefixed host while a dozen
- * others carried sign-in, gates, telemetry and downloads — and qodercli holds
- * more than one TLS client, not all of which read NODE_EXTRA_CA_CERTS.
- * Decrypting a tunnel owned by one of those buys nothing and breaks the call,
- * so those hosts are left alone.
+ * terminated, which is what an absent pattern means. Qoder's can at least be
+ * narrowed — the model call is elected per run onto one of two host shapes,
+ * while a dozen other hosts carry sign-in, gates, telemetry and downloads —
+ * and qodercli holds more than one TLS client, not all of which read
+ * NODE_EXTRA_CA_CERTS. Decrypting a tunnel owned by one of those buys nothing
+ * and breaks the call, so those hosts are left alone. The narrowing does have
+ * to cover every shape the election can land on, though: miss one and that
+ * run's inference tunnel is spliced, its model call goes through fine and
+ * nothing is ever written to the logs folder. agents.ts writes the set down.
  */
 export function terminatesTls(
   host: string,

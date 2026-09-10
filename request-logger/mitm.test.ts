@@ -204,9 +204,7 @@ function agentSide(agent: net.Socket): {
 }
 
 describe("terminatesTls", () => {
-  // The catalogue's own answer, for the one agent that has one. No host below
-  // is invented: every one was minted a certificate by a live qodercli 1.1.47
-  // run, and only the first ever carried a model call.
+  // The catalogue's own answer, for the one agent that has one.
   const qoder = qoderSubscription().mitmHosts;
 
   it("terminates every tunnel when the catalogue predicts no host", () => {
@@ -216,38 +214,57 @@ describe("terminatesTls", () => {
     expect(terminatesTls("", undefined)).toBe(true);
   });
 
-  it("terminates the host a Qoder model call is actually sent to", () => {
+  // Every host below is one qodercli itself named, in the `endpoint=` field of
+  // its own run log, as where sendRemoteChatAsk went. Which of them a run
+  // lands on is decided by the region election, and the bare `api<N>` shape is
+  // the more common of the two — so a pattern covering only one of them makes
+  // logging a coin flip, the run that lands elsewhere having its inference
+  // tunnel spliced through unread and nothing written.
+  it.each([
+    "api1.qoder.sh",
+    "api2.qoder.sh",
+    "api3.qoder.sh",
+    "api.qoder.xin",
+    "b1731805-d1a6-41f6-9de4-52d8d015da84-api.qoder.xin",
+  ])("terminates %s, which is where a Qoder model call lands", (host) => {
     expect(qoder).toBeInstanceOf(RegExp);
-    expect(
-      terminatesTls("b1731805-d1a6-41f6-9de4-52d8d015da84-api.qoder.xin", qoder)
-    ).toBe(true);
+    expect(terminatesTls(host, qoder)).toBe(true);
+  });
+
+  it("terminates the same shape on an apex no run has been seen to elect", () => {
+    // Invented, unlike the list above. The apex alternation is wider than the
+    // hosts anyone has observed, and `com.cn` is the case that matters: the
+    // apex itself holds a dot, which is easy to get wrong.
     expect(terminatesTls("tenant-api.qoder.com.cn", qoder)).toBe(true);
-    expect(terminatesTls("tenant-api.qoder.sh", qoder)).toBe(true);
   });
 
   it.each([
     "center.qoder.sh",
     "b1731805-d1a6-41f6-9de4-52d8d015da84-center.qoder.xin",
     "openapi.qoder.sh",
-    "api3.qoder.sh",
-    "api5.qoder.com.cn",
+    "b1731805-d1a6-41f6-9de4-52d8d015da84-openapi.qoder.xin",
     "download.qoder.com",
     "qoder-ide.oss-accelerate.aliyuncs.com",
     "mcp.context7.com",
     "registry.anpm.alibaba-inc.com",
   ])("passes %s through unread", (host) => {
-    // Each of these arrived on a tunnel qodercli then rejected the certificate
-    // for. Decrypting them bought nothing and broke the call.
+    // None of these carries a model call. qodercli reaches them for the region
+    // election, sign-in, feature gates, downloads, MCP servers and npm, on TLS
+    // clients that do not all read NODE_EXTRA_CA_CERTS — so decrypting them
+    // buys nothing and can break the call. The tenant-prefixed two and
+    // `openapi` are the near-misses, each one label away from a host that does
+    // carry it.
     expect(terminatesTls(host, qoder)).toBe(false);
   });
 
   it("is not talked into a host by one that merely contains the right words", () => {
-    // Anchored, so a name this tool has no business decrypting cannot get in
-    // by being wrapped around one that can.
+    // Anchored, so a name this tool has no business decrypting cannot get in by
+    // being wrapped around one that can. Invented on purpose, unlike the two
+    // lists above.
     expect(terminatesTls("tenant-api.qoder.xin.evil.example", qoder)).toBe(false);
     expect(terminatesTls("evil-tenant-api.qoder.xin.attacker.test", qoder)).toBe(false);
+    expect(terminatesTls("api3.qoder.sh.attacker.test", qoder)).toBe(false);
     expect(terminatesTls("notqoder.xin", qoder)).toBe(false);
-    expect(terminatesTls("api.qoder.xin", qoder)).toBe(false);
   });
 });
 

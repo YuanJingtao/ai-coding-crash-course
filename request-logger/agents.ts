@@ -88,10 +88,10 @@ export interface ResolvedTarget {
    *
    * Optional, and absent means "all of them": an agent whose inference host
    * cannot be predicted has to have every tunnel terminated, or nothing it
-   * says is ever logged. Qoder's can be predicted, and decrypting a tunnel
-   * that belongs to one of the TLS clients in qodercli which ignores
-   * NODE_EXTRA_CA_CERTS only breaks that call — so it names the hosts a model
-   * call can be on. See the subscription provider and mitm.ts.
+   * says is ever logged. Qoder's can at least be narrowed to a set of shapes,
+   * and decrypting a tunnel that belongs to one of the TLS clients in qodercli
+   * which ignores NODE_EXTRA_CA_CERTS only breaks that call — so it names the
+   * hosts a model call can be on. See the subscription provider and mitm.ts.
    */
   mitmHosts?: RegExp;
 }
@@ -452,8 +452,8 @@ const JUNIE_MERGE_NOTE =
  * approach:
  *
  *  - It elects its own upstream host at runtime (a region lookup plus
- *    Aliyun HTTPDNS, behind a tenant-prefixed domain) and offers no
- *    base-URL override at all. `QODER_MODEL_SERVER_HOST` exists in the
+ *    Aliyun HTTPDNS) and offers no base-URL override at all.
+ *    `QODER_MODEL_SERVER_HOST` exists in the
  *    binary but belongs to a newer transport that is gated off, so it is
  *    never read on this route. There is therefore no URL to hand Qoder —
  *    the only way to stand between the two is `HTTPS_PROXY`, which makes
@@ -1059,15 +1059,20 @@ const AGENTS: AgentEntry[] = [
         renderer: "qoder",
         bin: "qodercli",
         mitm: true,
-        // The only shape a model call has ever been seen on: qodercli names its
-        // inference server `<tenant>-api.<apex>`, the apex being whichever of
-        // these the region lookup elected. Everything else it dials is left
-        // alone — `center` and `openapi` for sign-in and feature gates, `api3`
-        // and `api5` for the region lookup itself, OSS for downloads, and third
-        // parties for MCP servers and npm. Those arrive on tunnels owned by TLS
-        // clients that do not all read NODE_EXTRA_CA_CERTS, so decrypting them
-        // breaks calls that carry nothing worth reading.
-        mitmHosts: /^[^.]+-api\.qoder\.(xin|sh|com\.cn|com|ai)$/i,
+        // Both shapes a model call has been seen on, from qodercli's own
+        // `endpoint=` log field: a bare `api<N>.qoder.<apex>` and a
+        // tenant-prefixed `<tenant>-api.qoder.<apex>`. The region election
+        // picks between them per run and the bare shape is the more common of
+        // the two, so matching only one of them makes logging a coin flip —
+        // the inference tunnel is spliced through unread and nothing is
+        // written. Everything else qodercli dials is left alone: `center` for
+        // the election itself, `openapi` for sign-in and feature gates, both
+        // on either apex, OSS for downloads, and third parties for MCP servers
+        // and npm. Those arrive on tunnels owned by TLS clients that do not all
+        // read NODE_EXTRA_CA_CERTS, so decrypting them breaks calls that carry
+        // nothing worth reading. The `^` and the `-api` anchor are what keep
+        // `openapi` and `center` out, including the tenant-prefixed ones.
+        mitmHosts: /^(?:[^.]*-)?api\d*\.qoder\.(xin|sh|com\.cn|com|ai)$/i,
         env: [
           ["HTTPS_PROXY", "{proxyUrl}"],
           ["NODE_EXTRA_CA_CERTS", "{caPath}"],
@@ -1251,8 +1256,8 @@ export function shouldLogRequest(
   // with a capital G, and the non-streaming one is `:generateContent`.
   if (renderer === "gemini") return /generateContent/i.test(reqPath);
   // `agent_chat_generation` is the subscription route's inference call, under
-  // whichever tenant-prefixed host the region lookup elected. The second path
-  // is the plain-HTTP transport qodercli also carries, which posts the same
+  // whichever host the region lookup elected. The second path is the
+  // plain-HTTP transport qodercli also carries, which posts the same
   // request unencoded; it is not what HTTPS_PROXY selects, but it renders the
   // same way and would otherwise be dropped as housekeeping.
   if (renderer === "qoder") {

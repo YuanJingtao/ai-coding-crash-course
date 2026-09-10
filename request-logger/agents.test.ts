@@ -1688,23 +1688,42 @@ describe("resolveChoice — Qoder subscription", () => {
     expect(isMitmTarget(resolveChoice(SUBSCRIPTION, PORT))).toBe(true);
   });
 
-  it("names the hosts it decrypts, so the rest can be passed through unread", () => {
+  it("decrypts every host the model call has been seen on", () => {
     // qodercli holds more than one TLS client and they do not all read
     // NODE_EXTRA_CA_CERTS, so a tunnel terminated for the wrong one is a tunnel
-    // broken. Only the host a model call can be on is worth the risk.
+    // broken. Only the host a model call can be on is worth the risk — and a
+    // model call can be on any of these. Which one it lands on is decided per
+    // run by the region election, so a pattern narrower than this list makes
+    // logging a coin flip.
     const hosts = target("qoder", "subscription").mitmHosts;
     expect(hosts).toBeInstanceOf(RegExp);
-    // Every name below was minted a certificate by a live qodercli 1.1.47 run.
-    expect(hosts!.test("b1731805-d1a6-41f6-9de4-52d8d015da84-api.qoder.xin")).toBe(true);
+    // Every name below is one qodercli itself reported as the endpoint for
+    // sendRemoteChatAsk, in the `endpoint=` field of its own run log.
+    for (const host of [
+      "api1.qoder.sh",
+      "api2.qoder.sh",
+      "api3.qoder.sh",
+      "b1731805-d1a6-41f6-9de4-52d8d015da84-api.qoder.xin",
+    ]) {
+      expect(hosts!.test(host)).toBe(true);
+    }
+  });
+
+  it("passes through unread every host the model call is not on", () => {
+    const hosts = target("qoder", "subscription").mitmHosts!;
+    // From the `host=` field of qodercli's own run logs: sign-in, feature
+    // gates, region lookup, downloads. The two tenant-prefixed ones and
+    // `openapi.qoder.sh` are the near-misses — each is one label away from a
+    // host that does carry the model call, and decrypting them buys nothing.
     for (const host of [
       "center.qoder.sh",
       "openapi.qoder.sh",
-      "api3.qoder.sh",
-      "api5.qoder.com.cn",
+      "b1731805-d1a6-41f6-9de4-52d8d015da84-center.qoder.xin",
+      "b1731805-d1a6-41f6-9de4-52d8d015da84-openapi.qoder.xin",
       "download.qoder.com",
       "qoder-ide.oss-accelerate.aliyuncs.com",
     ]) {
-      expect(hosts!.test(host)).toBe(false);
+      expect(hosts.test(host)).toBe(false);
     }
   });
 
@@ -1740,8 +1759,8 @@ describe("resolveChoice — Qoder subscription", () => {
 
   it("names no upstream host, because the host arrives with each connection", () => {
     // Every other target forwards to a host chosen here. This one cannot:
-    // Qoder elects its own at runtime, behind a tenant-prefixed domain, and
-    // offers no override, so mitm.ts fills this in per connection instead.
+    // Qoder elects its own at runtime and offers no override, so mitm.ts fills
+    // this in per connection instead.
     expect(target("qoder", "subscription").upstreamHost).toBe("");
   });
 

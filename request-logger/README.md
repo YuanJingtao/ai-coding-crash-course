@@ -204,11 +204,11 @@ agent here.
 a reverse proxy: you are handed a base URL, your agent calls it, and the host on
 the other side is known before the first request arrives. Qoder's subscription
 route has no base-URL override to hand you. It elects its own inference server
-at runtime — a region lookup, then Aliyun HTTPDNS, behind a tenant-prefixed
-domain — so there is nothing to point it at, and nowhere to stand except in the
-middle of the connection. The `QODER_*_BASE_URL` names in the shipped binary
-look like overrides and are not: they are compile-time constants, and nothing
-reads them at runtime.
+at runtime — a region lookup, then Aliyun HTTPDNS — and the name it lands on
+varies in shape from run to run, so there is nothing to point it at, and
+nowhere to stand except in the middle of the connection. The `QODER_*_BASE_URL`
+names in the shipped binary look like overrides and are not: they are
+compile-time constants, and nothing reads them at runtime.
 
 So this route makes the tool the proxy that `HTTPS_PROXY` names, and it answers
 the `CONNECT` that then arrives. That is a man-in-the-middle rather than a
@@ -233,12 +233,19 @@ never a model call. One live run, before this rule existed, had its certificate
 rejected on 24 of the 59 tunnels it opened, and not one of the 24 was carrying
 anything worth logging.
 
-So the catalogue names the hosts inference can be on. `qodercli` reaches its
-model server as `<tenant>-api.<apex>`, the apex being whichever of `qoder.xin`,
-`qoder.sh`, `qoder.com.cn`, `qoder.com` or `qoder.ai` the region lookup elected.
-Those tunnels get a certificate. Every other tunnel is joined straight to the
-host it named and carries bytes this tool never reads in either direction, which
-for that call is indistinguishable from not being proxied at all.
+So the catalogue names the hosts inference can be on, and there is more than one
+of them. `qodercli` reaches its model server either as `api<N>.<apex>` or as
+`<tenant>-api.<apex>`, the apex being whichever of `qoder.xin`, `qoder.sh`,
+`qoder.com.cn`, `qoder.com` or `qoder.ai` the region lookup elected — and which
+of the two shapes it lands on is decided per run. Counting the elections this
+machine's own `qodercli` logged, the bare shape won 2672 times and the
+tenant-prefixed one 1538. A rule naming only the second therefore made logging a
+coin flip, and a quiet one: the run that elected the first had its inference
+tunnel spliced, its model call reach Qoder perfectly, and nothing written to the
+logs folder. Those tunnels get a certificate. Every other tunnel is joined
+straight to the host it named and carries bytes this tool never reads in either
+direction, which for that call is indistinguishable from not being proxied at
+all.
 
 Each tunnel prints one dim line saying which of the two happened —
 `tunnel open -> …` was decrypted, `tunnel passed through unread -> …` was not —
@@ -529,12 +536,16 @@ failed` on _every_ tunnel with the logs folder still empty. One such line on its
    succeeds — worth an issue, since it means a host the rule should splice is
    being terminated instead. The same folder staying empty with _no_ failure at
    all, and `tunnel passed through unread -> …` lines naming something shaped
-   like `<tenant>-api.<apex>`, is the rule missing the inference host: that is
-   also worth an issue, and the fix is one line in `agents.ts`. The other way to
-   get every tunnel failing is to leave an agent running across a restart of
-   this proxy: the CA is minted fresh every run, so that agent is still trusting
-   a certificate which no longer exists. Start the agent from the command the
-   banner prints, after the banner prints it.
+   like `api<N>.<apex>` or `<tenant>-api.<apex>`, is the rule missing the
+   inference host: that is also worth an issue, and the fix is one line in
+   `agents.ts`. To be sure it is the inference host and not an ordinary spliced
+   tunnel, read the election off `qodercli`'s own log — `~/.qoder/logs/runs/`
+   holds one directory per run, and the `endpoint=` field of its
+   `Inference transport ready` line names the host the model call went to.
+   The other way to get every tunnel failing is to leave an agent running
+   across a restart of this proxy: the CA is minted fresh every run, so that
+   agent is still trusting a certificate which no longer exists. Start the
+   agent from the command the banner prints, after the banner prints it.
 
 ## How much this was tested
 
@@ -570,9 +581,10 @@ Be fair to the tool when you judge a failure.
   encoding on 452 bodies of its own, and is byte-identical across 1.1.45, 1.1.46
   and 1.1.47.
   The same run verified the two pass-through paths. It opened 23 tunnels,
-  decrypted the two to the inference host, spliced the other 21 unread, and
-  finished with no handshake failure at all — where an earlier run, before the
-  host rule existed, had its certificate rejected on 24 of 59. And `qodercli`
+  decrypted the two to the inference host — a tenant-prefixed one, see below —
+  spliced the other 21 unread, and finished with no handshake failure at all —
+  where an earlier run, before the host rule existed, had its certificate
+  rejected on 24 of 59. And `qodercli`
   sent two HTTPDNS lookups, both answered, where a run before the plain-request
   path existed collected 28 refusals and then fell back to the system resolver.
   The forwarding tests drive `http` on an arbitrary port, with a body and
@@ -582,10 +594,14 @@ Be fair to the tool when you judge a failure.
   turns only. A long session through this route — many tool calls, images, a
   compacted history — has not been driven, and `patches` and `cache_id`, the two
   fields that would let Qoder send a reference instead of message text, never
-  appeared. Nor has the host rule met a tenant whose inference server is not
-  shaped `<tenant>-api.<apex>`. If a Qoder deployment names it differently this
-  tool splices that tunnel and logs nothing, which is why each one is announced
-  on its own line in the console.
+  appeared. The host rule, likewise, has been driven live on only one of the two
+  shapes it covers: that run elected `<tenant>-api.<apex>`, so the bare
+  `api<N>.<apex>` shape — the one that wins the election more often — is matched
+  by the pattern and by the tests, but has not yet had a certificate minted for
+  it on a real tunnel. A Qoder deployment that names its inference server
+  something else again is covered by neither, and this tool would splice that
+  tunnel and log nothing, which is why each one is announced on its own line in
+  the console.
 - **Qoder's BYOK route was never driven end to end.** The account this was
   researched on has the `custom_providers` gate switched off, so `/model` shows
   no Custom option to paste a base URL into. What is tested is the wizard's
@@ -643,6 +659,11 @@ line in `agents.ts`.
   client fails, so set `mitmHosts` to a pattern matching only the hosts a model
   call can be on. Everything else is then spliced straight to the host it named
   and read by nothing, which leaves those calls working exactly as they were.
+  The trap is in that word "only". An agent which elects its inference host per
+  run needs every shape the election can land on, not the one you happened to
+  watch, and a pattern one shape too narrow fails silently: the model call
+  succeeds, the agent behaves normally, and the logs folder stays empty. Qoder's
+  second shape took another run to find.
 - **Add a provider that is only a template**, the way Qoder's two BYOK entries
   are: set `templateOnly: true`. It lends its bin, env, suffix and notes to a
   custom base URL through `customTemplateFor`, and is never offered at the
