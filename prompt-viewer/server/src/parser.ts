@@ -21,6 +21,7 @@ import type {
   Section,
   SkillEntry,
   SkillLocation,
+  SkillProvenance,
   SkillShareEntry,
   SkillScope,
   SkillSource,
@@ -329,6 +330,8 @@ export function parseWireLog(
   categoryIndex: Map<string, string> = new Map(),
   /** 技能来源映射（server/skill-sources.json，人工考证）；未收录为 null */
   sourceIndex: Map<string, SkillSource> = new Map(),
+  /** 出处凭据映射（扫注册表解析，见 skillProvenance.ts）；查不到为 null */
+  provenanceIndex: Map<string, SkillProvenance> = new Map(),
   /** 磁盘兜底描述读取器（注入，保持本模块不碰 fs）；仅 wire 无描述且有目录时调用 */
   diskDescriptionOf: (dir: string) => string | null = () => null,
 ): ParsedLog {
@@ -583,6 +586,7 @@ export function parseWireLog(
           s.description === null && loc ? (diskDescriptionOf(loc.dir) ?? null) : null,
         categoryId: categoryIndex.get(s.name) ?? null,
         source: sourceIndex.get(s.name) ?? null,
+        provenance: provenanceIndex.get(s.name) ?? null,
       };
     })
     .sort((a, b) => SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope] || b.tokens - a.tokens);

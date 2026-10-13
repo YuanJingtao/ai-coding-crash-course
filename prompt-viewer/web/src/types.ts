@@ -97,15 +97,35 @@ export interface ContextCategoryStats {
 /** 技能作用域（/context 四组；unknown = 扫盘反推不可用） */
 export type SkillScope = "project" | "user" | "plugin" | "builtin" | "unknown";
 
-/** 技能来源（安装/获得渠道），与 Scope 正交；人工考证维护于 server/skill-sources.json —— 与 server 同构 */
+/**
+ * 技能来源（**获得渠道**），与 Scope（归属层级）、SkillVendor（上游作者）三者正交；
+ * 人工考证维护于 server/skill-sources.json —— 与 server 同构
+ */
 export type SkillSource =
   | "aone"
   | "npx"
   | "plugin"
   | "builtin"
-  | "official"
+  | "manual"
   | "personal"
   | "unknown";
+
+/** 技能作者归属（**上游是谁写的**）——与 server 同构 */
+export type SkillVendor = "anthropic" | "vercel" | "alibaba" | "qoder" | "community";
+
+/**
+ * 出处凭据（server 扫注册表解析）。evidence 决定可信度：
+ * install-record = 本机安装凭据（确凿）；catalog-match = 上游目录同名匹配（弱，可能同名不同源）；
+ * manual = 仅有人工 vendor 指定、无 repo 凭据 —— 与 server 同构
+ */
+export interface SkillProvenance {
+  repo: string | null;
+  url: string | null;
+  evidence: "install-record" | "catalog-match" | "manual";
+  installedAt: string | null;
+  vendor: SkillVendor | null;
+  identifier: string | null;
+}
 
 /** 扫盘反推的技能位置：作用域 + 含 SKILL.md 的目录绝对路径 */
 export interface SkillLocation {
@@ -133,8 +153,10 @@ export interface SkillShareEntry {
   diskDescription: string | null;
   /** 用户手动分类的 id；name→categoryId 全局映射，跨日志生效。未归类为 null（进未分类收件箱） */
   categoryId: string | null;
-  /** 技能来源；来自 server/skill-sources.json 全局映射，未收录为 null */
+  /** 技能来源（获得渠道）；来自 server/skill-sources.json 全局映射，未收录为 null */
   source: SkillSource | null;
+  /** 出处凭据（上游 repo / 可点击地址 / 作者归属 / 证据强度）；无凭据为 null */
+  provenance: SkillProvenance | null;
 }
 
 /** 分类色板（与 web/src/index.css 的 6 色 neon 一一对应）——与 server 同构 */

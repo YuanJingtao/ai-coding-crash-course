@@ -105,22 +105,54 @@ export interface ContextCategoryStats {
 export type SkillScope = "project" | "user" | "plugin" | "builtin" | "unknown";
 
 /**
- * 技能来源（安装/获得渠道），与 Scope（归属层级）正交：
+ * 技能来源（**获得渠道**：我从哪条路拿到这个技能），与 Scope（归属层级）正交，
+ * 也与 SkillVendor（上游作者）正交——同一技能可以是「从 Aone 市场下的」且「Anthropic 写的」：
  * aone = Aone 技能市场（a1 skill get 可查到且 desc 一致，或确认为市场升级导致的 desc 漂移）；
- * npx = `npx skills add` 安装（skills-lock.json 有记录）；
+ * npx = skills CLI 安装（`skills-lock.json` / `.skill-lock.json` 有记录）；
  * plugin = qodercli 插件市场（wire 名带 `plugin:skill` 前缀）；
- * builtin = qodercli 内置；official = Anthropic/Qoder 官方技能包或第三方公版；
+ * builtin = qodercli 内置；manual = 手动放置（拷进技能目录，无安装凭据可查）；
  * personal = 个人创建；unknown = 已删除等无法考证。
  * 人工考证维护于 server/skill-sources.json（name→source 全局映射），查不到为 null。
+ *
+ * 注：曾经有一档 `official`，它表达的其实是「上游作者」而非渠道，与 vendor 维度重复，已废弃。
  */
 export type SkillSource =
   | "aone"
   | "npx"
   | "plugin"
   | "builtin"
-  | "official"
+  | "manual"
   | "personal"
   | "unknown";
+
+/**
+ * 技能作者归属（**上游是谁写的**），与 SkillSource（我怎么拿到的）正交。
+ * 由出处 repo 的 owner 经 FIRST_PARTY_ORGS 判定：命中第一方 org = 对应厂商官方，
+ * 其余（个人/社区作者，如 JimLiu、mattpocock）= community（公版）。
+ * 内部包等无公网 repo 的靠 skill-sources.json 的 `vendors` 段人工指定（如 dws → alibaba）。
+ */
+export type SkillVendor = "anthropic" | "vercel" | "alibaba" | "qoder" | "community";
+
+/**
+ * 技能出处凭据（扫注册表解析，见 skillProvenance.ts）。
+ * evidence 决定可信度，UI 必须区分展示：
+ * install-record = 本机安装凭据（skills CLI lock / hermes hub lock），确凿；
+ * catalog-match = 上游目录同名条目，只证明「有个同名技能在那个 repo」，同名不同源会误判；
+ * manual = 仅有 skill-sources.json 的人工 vendor 指定，无 repo 凭据。
+ */
+export interface SkillProvenance {
+  /** 上游仓库 `owner/repo`；无公网 repo 为 null */
+  repo: string | null;
+  /** 可点击出处（GitHub 目录页）；无公网 repo 为 null */
+  url: string | null;
+  evidence: "install-record" | "catalog-match" | "manual";
+  /** 安装时间（仅 skills CLI v3 lock 有）；无则 null */
+  installedAt: string | null;
+  /** 上游作者归属；无法判定为 null */
+  vendor: SkillVendor | null;
+  /** 无公网 repo 时的替代线索（hermes identifier，如 `official/security/1password`） */
+  identifier: string | null;
+}
 
 /** 扫盘反推的技能位置：作用域 + 含 SKILL.md 的目录绝对路径 */
 export interface SkillLocation {
@@ -155,8 +187,13 @@ export interface SkillShareEntry {
    * 跨日志生效（同名技能在任何日志里都套同一分类）。未归类为 null（进未分类收件箱）。
    */
   categoryId: string | null;
-  /** 技能来源（见 SkillSource）；来自 server/skill-sources.json 全局映射，未收录为 null */
+  /** 技能来源（获得渠道，见 SkillSource）；来自 server/skill-sources.json 全局映射，未收录为 null */
   source: SkillSource | null;
+  /**
+   * 出处凭据（上游 repo / 可点击地址 / 作者归属 / 证据强度），解析期扫注册表所得。
+   * 无任何凭据且无人工 vendor 指定时为 null。结果依赖解析机器，见 skillProvenance.ts。
+   */
+  provenance: SkillProvenance | null;
 }
 
 /** 分类色板（与 web/src/index.css 的 6 色 neon 一一对应） */

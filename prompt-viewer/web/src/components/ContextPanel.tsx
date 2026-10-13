@@ -6,9 +6,11 @@ import type {
   ParsedLog,
   SkillCategoriesDoc,
   SkillCategory,
+  SkillProvenance,
   SkillShareEntry,
   SkillScope,
   SkillSource,
+  SkillVendor,
 } from "../types";
 import { fmtNum, fmtWindow } from "../format";
 import { Badge, SectionCard } from "./SectionCard";
@@ -38,12 +40,14 @@ const shortPath = (p: string) => p.replace(/^\/Users\/[^/]+\//, "~/");
  * Skills 明细的可拖拽列，列宽存 localStorage。
  * flex 列（描述/位置）用 minmax(宽,1fr) 自动伸展吸收容器剩余宽度——宽屏下多出来的
  * 空间给这两列内容而不是留白或拉长比例条；拖拽为它们设置最小宽。其余列为固定 px，拖拽精确生效。
+ * 增删列会使已存列宽失效（readColWidths 校验长度），回退默认值即可，无需迁移。
  */
 const COLS = [
   { key: "name", label: "技能", align: "left", def: 150, min: 80, flex: false, fr: 0 },
   { key: "desc", label: "描述", align: "left", def: 200, min: 120, flex: true, fr: 1 },
   { key: "path", label: "位置", align: "left", def: 160, min: 120, flex: true, fr: 1.6 },
-  { key: "source", label: "来源", align: "left", def: 76, min: 56, flex: false, fr: 0 },
+  { key: "source", label: "渠道", align: "left", def: 66, min: 52, flex: false, fr: 0 },
+  { key: "vendor", label: "作者", align: "left", def: 118, min: 72, flex: false, fr: 0 },
   { key: "cat", label: "分类", align: "left", def: 120, min: 70, flex: false, fr: 0 },
   { key: "tokens", label: "tokens", align: "right", def: 84, min: 56, flex: false, fr: 0 },
   { key: "share", label: "占比", align: "right", def: 64, min: 44, flex: false, fr: 0 },
@@ -82,7 +86,10 @@ const SCOPE_META: Record<SkillScope, { label: string; icon: string; text: string
 };
 const SCOPE_ORDER: SkillScope[] = ["project", "user", "plugin", "builtin", "unknown"];
 
-/** 技能来源的展示元数据（badge 文案 + 配色 + 悬浮说明）；null（未收录）显示「—」 */
+/**
+ * 技能**渠道**（我怎么拿到的）的展示元数据；null（未收录）显示「—」。
+ * 与「作者」列正交：同一技能可以是「从 Aone 市场下的」且「Anthropic 写的」。
+ */
 const SOURCE_META: Record<SkillSource, { label: string; cls: string; hint: string }> = {
   aone: {
     label: "aone",
@@ -92,7 +99,7 @@ const SOURCE_META: Record<SkillSource, { label: string; cls: string; hint: strin
   npx: {
     label: "npx",
     cls: "border-neon-green/40 bg-neon-green/10 text-neon-green",
-    hint: "npx skills add 安装（skills-lock.json 有记录）",
+    hint: "skills CLI 安装（skills-lock.json / .skill-lock.json 有记录）",
   },
   plugin: {
     label: "插件",
@@ -104,10 +111,10 @@ const SOURCE_META: Record<SkillSource, { label: string; cls: string; hint: strin
     cls: "border-ink-600 bg-ink-800/60 text-mist-400",
     hint: "qodercli 内置技能",
   },
-  official: {
-    label: "官方",
-    cls: "border-neon-amber/40 bg-neon-amber/10 text-neon-amber",
-    hint: "Anthropic/Qoder 官方技能包或第三方公版技能",
+  manual: {
+    label: "手动",
+    cls: "border-ink-600 bg-ink-800/40 text-mist-400",
+    hint: "手动放置到技能目录（无安装凭据可查）",
   },
   personal: {
     label: "个人",
@@ -120,6 +127,65 @@ const SOURCE_META: Record<SkillSource, { label: string; cls: string; hint: strin
     hint: "已删除或市场无权限等，来源无法考证",
   },
 };
+
+/**
+ * 技能**作者**（上游是谁写的）的展示元数据。第一方厂商显示「官方·<厂商>」，
+ * 个人/社区公开包统一显示「公版」。
+ */
+const VENDOR_META: Record<SkillVendor, { label: string; cls: string; whose: string }> = {
+  anthropic: {
+    label: "官方·Anthropic",
+    cls: "border-neon-amber/40 bg-neon-amber/10 text-neon-amber",
+    whose: "Anthropic（anthropics/skills）",
+  },
+  vercel: {
+    label: "官方·Vercel",
+    cls: "border-neon-amber/40 bg-neon-amber/10 text-neon-amber",
+    whose: "Vercel（vercel-labs）",
+  },
+  alibaba: {
+    label: "官方·阿里",
+    cls: "border-neon-amber/40 bg-neon-amber/10 text-neon-amber",
+    whose: "阿里巴巴 / 钉钉",
+  },
+  qoder: {
+    label: "官方·Qoder",
+    cls: "border-neon-amber/40 bg-neon-amber/10 text-neon-amber",
+    whose: "Qoder",
+  },
+  community: {
+    label: "公版",
+    cls: "border-neon-cyan/30 bg-neon-cyan/5 text-neon-cyan",
+    whose: "个人 / 社区公开发布的技能包",
+  },
+};
+
+/** 证据强度的 TSV 文案（导出到 Excel 后要能独立读懂，不依赖 badge 样式） */
+const EVIDENCE_LABEL: Record<SkillProvenance["evidence"], string> = {
+  "install-record": "安装凭据",
+  "catalog-match": "同名推断",
+  manual: "人工指定",
+};
+
+/**
+ * 作者 badge 的悬浮说明：证据强度必须让用户看得见——catalog-match 只是上游目录同名匹配，
+ * 不证明本机这份就是从那儿装的（同名不同源会误判），故用虚线边框 + 文案双重提示。
+ */function vendorHint(p: SkillShareEntry["provenance"], meta: { whose: string }): string {
+  if (!p) return meta.whose;
+  const lines = [`上游作者：${meta.whose}`];
+  if (p.repo) lines.push(`仓库：${p.repo}`);
+  if (p.identifier) lines.push(`标识：${p.identifier}`);
+  lines.push(
+    p.evidence === "install-record"
+      ? "证据：本机安装凭据（确凿）"
+      : p.evidence === "catalog-match"
+        ? "证据：上游目录同名匹配（推断，可能同名不同源）"
+        : "证据：人工指定（无 repo 凭据）",
+  );
+  if (p.installedAt) lines.push(`安装于：${p.installedAt.slice(0, 10)}`);
+  if (p.url) lines.push("点击打开上游目录");
+  return lines.join("\n");
+}
 
 /** 四分类的视觉映射（颜色与页面其他 section 呼应） */
 const CAT_META: Record<
@@ -187,6 +253,8 @@ const SkillRow = memo(function SkillRow({
   saving: boolean;
   onAssign: (name: string, catId: string | null) => void;
 }) {
+  const prov = s.provenance;
+  const vendorMeta = prov?.vendor ? VENDOR_META[prov.vendor] : null;
   return (
     <div
       className={`grid items-center gap-2 rounded-md border px-2.5 py-1.5 ${
@@ -274,7 +342,41 @@ const SkillRow = memo(function SkillRow({
       ) : (
         <span
           className="truncate text-[11px] text-mist-600"
-          title="未收录于 server/skill-sources.json（来源档为人工考证维护）"
+          title="未收录于 server/skill-sources.json（渠道为人工考证维护）"
+        >
+          —
+        </span>
+      )}
+      {vendorMeta ? (
+        <span className="flex min-w-0 items-center">
+          {/* catalog-match 是上游目录同名匹配（弱证据），用虚线边框与实心的 install-record 区分 */}
+          {prov?.url ? (
+            <a
+              href={prov.url}
+              target="_blank"
+              rel="noreferrer"
+              className={`truncate rounded border px-1.5 py-px font-mono text-[10px] font-bold underline decoration-dotted underline-offset-2 hover:decoration-solid ${vendorMeta.cls} ${
+                prov.evidence === "catalog-match" ? "border-dashed" : ""
+              }`}
+              title={vendorHint(prov, vendorMeta)}
+            >
+              {vendorMeta.label}
+            </a>
+          ) : (
+            <span
+              className={`truncate rounded border px-1.5 py-px font-mono text-[10px] font-bold ${vendorMeta.cls} ${
+                prov?.evidence === "catalog-match" ? "border-dashed" : ""
+              }`}
+              title={vendorHint(prov, vendorMeta)}
+            >
+              {vendorMeta.label}
+            </span>
+          )}
+        </span>
+      ) : (
+        <span
+          className="truncate text-[11px] text-mist-600"
+          title="无出处凭据：本机注册表查不到上游 repo，且 skill-sources.json 未人工指定 vendor"
         >
           —
         </span>
@@ -655,7 +757,7 @@ export function ContextPanel({
   /** 按当前分组与排序生成 TSV（含分组列），粘贴到 Excel 即成表格 */
   const buildTsv = (): string => {
     const rows: string[][] = [
-      ["分组", "技能", "描述", "位置", "来源", "分类", "tokens", "占比%", "占位"],
+      ["分组", "技能", "描述", "位置", "渠道", "作者", "出处", "证据", "分类", "tokens", "占比%", "占位"],
     ];
     const walk = (g: SkillGroup, path: string) => {
       const gpath = path ? `${path} / ${g.label}` : g.label;
@@ -667,6 +769,9 @@ export function ContextPanel({
           cell(s.description ?? s.diskDescription),
           s.path ? shortPath(s.path) : "内置",
           s.source ? SOURCE_META[s.source].label : "",
+          s.provenance?.vendor ? VENDOR_META[s.provenance.vendor].label : "",
+          s.provenance?.url ?? s.provenance?.identifier ?? "",
+          s.provenance ? EVIDENCE_LABEL[s.provenance.evidence] : "",
           cid ? (tree.labels[cid] ?? cid) : "未分类",
           String(s.tokens),
           String(s.sharePercent),
@@ -770,7 +875,8 @@ export function ContextPanel({
       const cid = effCat(s.name);
       const catLabel = cid ? (catById.get(cid)?.label ?? cid) : "未分类";
       const srcLabel = s.source ? SOURCE_META[s.source].label : "?";
-      return `  [${SCOPE_META[s.scope].label}·${srcLabel}·${catLabel}] ${s.name}${s.placeholder ? " [占位]" : ""}: ${s.tokens} tok · ${s.sharePercent}%`;
+      const vendorLabel = s.provenance?.vendor ? VENDOR_META[s.provenance.vendor].label : "?";
+      return `  [${SCOPE_META[s.scope].label}·${srcLabel}·${vendorLabel}·${catLabel}] ${s.name}${s.placeholder ? " [占位]" : ""}: ${s.tokens} tok · ${s.sharePercent}%`;
     }),
   ].join("\n");
 

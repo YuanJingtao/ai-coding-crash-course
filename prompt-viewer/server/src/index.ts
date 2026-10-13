@@ -21,7 +21,8 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { classifyWireLog, parseWireLog } from "./parser.js";
 import { buildScopeIndex, listSkillFiles, readSkillDescription } from "./skillScopes.js";
-import { readSkillSources } from "./skillSources.js";
+import { buildProvenanceIndex } from "./skillProvenance.js";
+import { readSkillSources, type SkillSourcesDoc } from "./skillSources.js";
 import {
   buildCategoryIndex,
   CATEGORY_COLORS,
@@ -29,7 +30,7 @@ import {
   readCategoriesDoc,
   writeCategoriesDoc,
 } from "./skillCategories.js";
-import type { LogListItem, SkillCategoriesDoc, SkillLocation, SkillSource } from "./types.js";
+import type { LogListItem, SkillCategoriesDoc, SkillLocation, SkillProvenance } from "./types.js";
 
 const LOGS_DIR = path.resolve(import.meta.dirname, "../../../request-logger/logs");
 
@@ -55,13 +56,30 @@ function categoriesDoc(): SkillCategoriesDoc {
 const PORT = Number(process.env.PORT ?? 3001);
 
 /** 技能来源档：30s TTL 缓存（只读文件，无写路径） */
-let sourceCache: { at: number; index: Map<string, SkillSource> } | null = null;
-function sourceIndex(): Map<string, SkillSource> {
+let sourceCache: { at: number; doc: SkillSourcesDoc } | null = null;
+function sourcesDoc(): SkillSourcesDoc {
   const now = Date.now();
   if (!sourceCache || now - sourceCache.at > 30_000) {
-    sourceCache = { at: now, index: readSkillSources() };
+    sourceCache = { at: now, doc: readSkillSources() };
   }
-  return sourceCache.index;
+  return sourceCache.doc;
+}
+
+/**
+ * 出处凭据（扫注册表）：30s TTL 缓存。vendor 兜底取自来源档的 `vendors` 段，
+ * 故与 sourcesDoc 同周期失效即可，无需单独联动。
+ */
+let provenanceCache: { at: number; index: Map<string, SkillProvenance> } | null = null;
+function provenanceIndex(): Map<string, SkillProvenance> {
+  const now = Date.now();
+  if (!provenanceCache || now - provenanceCache.at > 30_000) {
+    provenanceCache = {
+      at: now,
+      // catalog 匹配需以「本机确实存在的技能」为闸，故依赖 scopeIndex（同为 30s TTL 扫盘）
+      index: buildProvenanceIndex(new Set(scopeIndex().keys()), sourcesDoc().vendors),
+    };
+  }
+  return provenanceCache.index;
 }
 
 const app = new Hono();
@@ -125,7 +143,8 @@ app.get("/api/logs/:id", async (c) => {
       text,
       scopeIndex(),
       buildCategoryIndex(categoriesDoc()),
-      sourceIndex(),
+      sourcesDoc().sources,
+      provenanceIndex(),
       readSkillDescription,
     );
     return c.json({ ok: true, log });

@@ -98,7 +98,7 @@ function isFileFollowingSymlinks(p: string): boolean {
 }
 
 /** skill-roots.json：{ "projectRoots": ["<qodercli 发起目录>", ...] } */
-function readProjectRoots(): string[] {
+export function readProjectRoots(): string[] {
   const cfg = path.resolve(import.meta.dirname, "../skill-roots.json");
   try {
     const j = JSON.parse(readFileSync(cfg, "utf8")) as { projectRoots?: unknown };
