@@ -1,0 +1,136 @@
+@import "tailwindcss";
+@import "highlight.js/styles/github-dark.css";
+
+@plugin "@tailwindcss/typography";
+
+@theme {
+  /* 深色 IDE 底色 */
+  --color-ink-950: #070a10;
+  --color-ink-900: #0b0e15;
+  --color-ink-850: #0f131d;
+  --color-ink-800: #141926;
+  --color-ink-700: #1d2433;
+  --color-ink-600: #2a3345;
+
+  /* 文本 */
+  --color-mist-100: #e8edf6;
+  --color-mist-300: #b9c3d6;
+  --color-mist-500: #7e8ba1;
+  --color-mist-700: #525d70;
+
+  /* 霓虹强调色 */
+  --color-neon-cyan: #56c8d8;
+  --color-neon-amber: #e5b567;
+  --color-neon-purple: #b48ead;
+  --color-neon-green: #99c794;
+  --color-neon-red: #ec5f67;
+  --color-neon-blue: #7aa2f7;
+
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: var(--color-ink-950);
+  /* 微弱的网格纹理，IDE 质感 */
+  background-image:
+    linear-gradient(rgba(86, 200, 216, 0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(86, 200, 216, 0.025) 1px, transparent 1px);
+  background-size: 32px 32px;
+  color: var(--color-mist-300);
+  font-family: var(--font-sans);
+}
+
+::selection {
+  background: rgba(86, 200, 216, 0.3);
+  color: #fff;
+}
+
+/* 滚动条 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-ink-600) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-ink-600);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 卡片发光边 */
+.glow-cyan {
+  box-shadow: 0 0 0 1px rgba(86, 200, 216, 0.25), 0 0 24px rgba(86, 200, 216, 0.08);
+}
+.glow-green {
+  box-shadow: 0 0 0 1px rgba(153, 199, 148, 0.35), 0 0 32px rgba(153, 199, 148, 0.12);
+}
+
+/* prose 深色定制 */
+.md-body {
+  --tw-prose-body: var(--color-mist-300);
+  --tw-prose-headings: var(--color-mist-100);
+  --tw-prose-links: var(--color-neon-cyan);
+  --tw-prose-bold: var(--color-mist-100);
+  --tw-prose-code: #e0af68;
+  --tw-prose-quotes: var(--color-mist-500);
+  --tw-prose-counters: var(--color-mist-500);
+  --tw-prose-bullets: var(--color-ink-600);
+  --tw-prose-hr: var(--color-ink-700);
+  --tw-prose-th-borders: var(--color-ink-600);
+  --tw-prose-td-borders: var(--color-ink-700);
+  font-size: 0.875rem;
+  line-height: 1.75;
+}
+.md-body pre {
+  background: var(--color-ink-950) !important;
+  border: 1px solid var(--color-ink-700);
+  border-radius: 0.5rem;
+  font-size: 0.8rem;
+}
+.md-body code:not(pre code) {
+  background: rgba(86, 200, 216, 0.08);
+  border: 1px solid rgba(86, 200, 216, 0.15);
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.8em;
+}
+.md-body code:not(pre code)::before,
+.md-body code:not(pre code)::after {
+  content: none;
+}
+.md-body table {
+  font-size: 0.8rem;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3 {
+  scroll-margin-top: 1rem;
+}
+
+/* 折叠动画 */
+details > summary {
+  list-style: none;
+  cursor: pointer;
+}
+details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.line-clamp-2 {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}

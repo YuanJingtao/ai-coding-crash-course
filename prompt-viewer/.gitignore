@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+
+# 个人技能分类档（name→categoryId 映射），本地状态，不入库
+server/skill-categories.json
+server/skill-categories.json.tmp
+
+# 技能来源档（name→source 映射，人工考证），本地状态，不入库
+server/skill-sources.json

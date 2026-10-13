@@ -1,0 +1,18 @@
+{
+  "name": "prompt-viewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Qoder wire 日志可视化查看器 —— 展示一次 LLM 请求的完整 prompt 结构",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "build": "npm run build -w web",
+    "start": "npm run build -w web && npm run start -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
