@@ -47,7 +47,7 @@ const COLS = [
   { key: "desc", label: "描述", align: "left", def: 200, min: 120, flex: true, fr: 1 },
   { key: "path", label: "位置", align: "left", def: 160, min: 120, flex: true, fr: 1.6 },
   { key: "source", label: "渠道", align: "left", def: 66, min: 52, flex: false, fr: 0 },
-  { key: "vendor", label: "作者", align: "left", def: 118, min: 72, flex: false, fr: 0 },
+  { key: "vendor", label: "作者", align: "left", def: 140, min: 84, flex: false, fr: 0 },
   { key: "cat", label: "分类", align: "left", def: 120, min: 70, flex: false, fr: 0 },
   { key: "tokens", label: "tokens", align: "right", def: 84, min: 56, flex: false, fr: 0 },
   { key: "share", label: "占比", align: "right", def: 64, min: 44, flex: false, fr: 0 },
@@ -170,7 +170,8 @@ const EVIDENCE_LABEL: Record<SkillProvenance["evidence"], string> = {
 /**
  * 作者 badge 的悬浮说明：证据强度必须让用户看得见——catalog-match 只是上游目录同名匹配，
  * 不证明本机这份就是从那儿装的（同名不同源会误判），故用虚线边框 + 文案双重提示。
- */function vendorHint(p: SkillShareEntry["provenance"], meta: { whose: string }): string {
+ */
+function vendorHint(p: SkillShareEntry["provenance"], meta: { whose: string }): string {
   if (!p) return meta.whose;
   const lines = [`上游作者：${meta.whose}`];
   if (p.repo) lines.push(`仓库：${p.repo}`);
@@ -185,6 +186,19 @@ const EVIDENCE_LABEL: Record<SkillProvenance["evidence"], string> = {
   if (p.installedAt) lines.push(`安装于：${p.installedAt.slice(0, 10)}`);
   if (p.url) lines.push("点击打开上游目录");
   return lines.join("\n");
+}
+
+/**
+ * 作者 badge 文案。公版统一叫「公版」会丢掉最关键的区分信息——是哪个社区作者的包，
+ * 故带上 repo owner（「公版·mattpocock」/「公版·JimLiu」）；第一方厂商的 label 本身已含厂商名。
+ * badge、TSV 导出、复制文本三处共用，保证口径一致。
+ */
+function vendorLabel(prov: SkillProvenance | null): string | null {
+  const v = prov?.vendor;
+  if (!v) return null;
+  if (v !== "community") return VENDOR_META[v].label;
+  const owner = prov.repo?.split("/")[0];
+  return owner ? `公版·${owner}` : VENDOR_META.community.label;
 }
 
 /** 四分类的视觉映射（颜色与页面其他 section 呼应） */
@@ -255,6 +269,7 @@ const SkillRow = memo(function SkillRow({
 }) {
   const prov = s.provenance;
   const vendorMeta = prov?.vendor ? VENDOR_META[prov.vendor] : null;
+  const vendorText = vendorLabel(prov);
   return (
     <div
       className={`grid items-center gap-2 rounded-md border px-2.5 py-1.5 ${
@@ -360,7 +375,7 @@ const SkillRow = memo(function SkillRow({
               }`}
               title={vendorHint(prov, vendorMeta)}
             >
-              {vendorMeta.label}
+              {vendorText}
             </a>
           ) : (
             <span
@@ -369,7 +384,7 @@ const SkillRow = memo(function SkillRow({
               }`}
               title={vendorHint(prov, vendorMeta)}
             >
-              {vendorMeta.label}
+              {vendorText}
             </span>
           )}
         </span>
@@ -769,7 +784,7 @@ export function ContextPanel({
           cell(s.description ?? s.diskDescription),
           s.path ? shortPath(s.path) : "内置",
           s.source ? SOURCE_META[s.source].label : "",
-          s.provenance?.vendor ? VENDOR_META[s.provenance.vendor].label : "",
+          s.provenance?.vendor ? (vendorLabel(s.provenance) ?? "") : "",
           s.provenance?.url ?? s.provenance?.identifier ?? "",
           s.provenance ? EVIDENCE_LABEL[s.provenance.evidence] : "",
           cid ? (tree.labels[cid] ?? cid) : "未分类",
@@ -875,8 +890,8 @@ export function ContextPanel({
       const cid = effCat(s.name);
       const catLabel = cid ? (catById.get(cid)?.label ?? cid) : "未分类";
       const srcLabel = s.source ? SOURCE_META[s.source].label : "?";
-      const vendorLabel = s.provenance?.vendor ? VENDOR_META[s.provenance.vendor].label : "?";
-      return `  [${SCOPE_META[s.scope].label}·${srcLabel}·${vendorLabel}·${catLabel}] ${s.name}${s.placeholder ? " [占位]" : ""}: ${s.tokens} tok · ${s.sharePercent}%`;
+      const vLabel = vendorLabel(s.provenance) ?? "?";
+      return `  [${SCOPE_META[s.scope].label}·${srcLabel}·${vLabel}·${catLabel}] ${s.name}${s.placeholder ? " [占位]" : ""}: ${s.tokens} tok · ${s.sharePercent}%`;
     }),
   ].join("\n");
 
