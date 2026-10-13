@@ -15,7 +15,7 @@
 | 磁盘兜底描述 | Disk Fallback Description | 占位技能（wire 只注入名字、无描述）时，Viewer 从技能目录 `SKILL.md` frontmatter 读取的 description，以弱化样式 + 💾 标注来源展示，与 wire 真值描述区分。Built-in 技能磁盘无目录，无兜底，仍显示"—"。 |
 | 列出技能 | Listed Skill | qodercli `/context` Skills 页展示的全部技能。列出数 ≥ 注入数：差值是标记 `disable-model-invocation: true` 的技能，它们只能由用户手动调用，零 token 成本、不进 wire。 |
 | 注入技能 | Injected Skill | 实际出现在 wire 技能列表注入中的技能。只有注入技能消耗 token；上下文面板中 Skills 份额的分母是注入列表而非列出列表。 |
-| 技能作用域 | Skill Scope | 技能的归属层级，对齐 qodercli `/context` 的三组：Project（qodercli 发起目录下 `.qoder/skills`、`.agents/skills`、`.claude/skills` 的技能，含指向用户级目录的符号链接）、User（用户级技能目录）、Built-in（qodercli 内置，磁盘无对应目录）。wire 注入列表不携带作用域字段；Viewer 在解析期扫盘 best-effort 反推，同名技能按 project > user 取先命中者，查不到的名字归 Built-in（残余启发式），扫盘不可用时标为 unknown。 |
+| 技能作用域 | Skill Scope | 技能的归属层级，对齐 qodercli `/skills` 的四组：Project（qodercli 发起目录下 `.qoder/skills`、`.agents/skills`、`.claude/skills` 的技能，含指向用户级目录的符号链接）、User（用户级技能目录）、Plugin（插件注册表 `installed_plugins_v2.json` + 缓存目录扫描，以 `pluginName:skillName` 命名空间索引，与 wire 注入名一致）、Built-in（qodercli 内置，磁盘无对应目录）。wire 注入列表不携带作用域字段；Viewer 在解析期扫盘 best-effort 反推，同名技能按 project > user 取先命中者，查不到的名字归 Built-in（残余启发式），扫盘不可用时标为 unknown。 |
 | 技能来源 | Skill Source | 技能的获得渠道，与作用域正交：aone（Aone 技能市场下载；`a1 skill get` 可查到且 desc 一致，或 desc 差异确认为市场/本地升级所致）、npx（`npx skills add` 安装，skills-lock.json 有记录）、plugin（qodercli 插件市场，wire 名带 `plugin:skill` 前缀）、builtin（qodercli 内置）、official（Anthropic/Qoder 官方技能包或第三方公版）、personal（个人创建）、unknown（已删除等无法考证）。来源是**人工考证**结论，存于 `server/skill-sources.json`（name→source 全局映射，gitignore，只读无 API 写路径）；未收录显示「—」。 |
 | 技能分类 | Skill Category | 用户**手动维护**的技能分组，表达"这个技能是干什么用的"（如 dataworks / 日常工具）。与作用域（扫盘反推、客观）相对，分类是主观的、由用户定义。分类是**一棵树**（`parentId`，null=顶级，如 dataworks → 官方/非官方）；一个技能只挂在一个节点上。每个分类有稳定 id、可改的 label、6 色 neon 之一、同级排序序号。 |
 | 分类映射 | Category Assignment | `技能名 → 分类 id` 的**全局映射**，不绑定具体日志。故切换日志时同名技能自动套用同一套分组。存于 `server/skill-categories.json`（个人本地状态）。 |
@@ -27,6 +27,7 @@
 | 上下文窗口容量 | Context Window | 请求 params 中的 `context_length`——该次请求的真上限。注意 `model-config` 的 `max_input_tokens` 不是窗口容量。 |
 | 校准 token 估算 | Calibrated Token Estimate | 本地启发式估算：CJK 码位 ×0.6 + 其余字符 ÷4。仅用于段间比例分配；有 Usage 锚时整体归一化到 `prompt_tokens` 真值。 |
 | 上下文面板 | Context Panel | Viewer 中复刻 qodercli `/context` 面板的派生视图：四分类占用（System prompt / System tools / Skills / Messages）+ 窗口占比 + per-skill 份额明细，数值为 wire 真值口径。Autocompact 在 wire 中无对应字段，恒显示 N/A。 |
+| 技能文件页 | Skill File Page | Viewer 的独立页面，展示某个技能磁盘目录下的全部文件（SKILL.md 及附属脚本/参考文档）的内容；从上下文面板 Skills 明细的技能名或 📄 新标签页打开，整页高度便于长时间阅读单个技能。 |
 | 上下文占用统计 | ContextStats | Parsed Log 中上下文面板对应的结构化产物：窗口容量、已用总量与归一化锚（usage / estimate）、四分类、注入技能份额、技能列表注入实例数。 |
 | 解析文档 | Parsed Log | 后端把一份 Wire 日志解析后产出的结构化 JSON（段树 + 每段统计 + 派生指标），是前端的唯一数据源。 |
 | 主对话请求 | Main Conversation Request | 承载用户与 agent 真实对话轮次的模型调用。Viewer 日志列表默认只展示这类请求。 |

@@ -565,7 +565,7 @@ export function parseWireLog(
   const locOf = (name: string) => (scopesUsable ? scopeIndex.get(name) : undefined);
   const scopeOf = (name: string): SkillScope =>
     scopesUsable ? (scopeIndex.get(name)?.scope ?? "builtin") : "unknown";
-  const SCOPE_ORDER: Record<SkillScope, number> = { project: 0, user: 1, builtin: 2, unknown: 3 };
+  const SCOPE_ORDER: Record<SkillScope, number> = { project: 0, user: 1, plugin: 2, builtin: 3, unknown: 4 };
   const skillShares: SkillShareEntry[] = canonicalSkills
     .map((s) => {
       const loc = locOf(s.name);

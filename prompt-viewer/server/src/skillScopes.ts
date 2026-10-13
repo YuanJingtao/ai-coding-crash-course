@@ -1,12 +1,14 @@
 /**
  * 技能作用域反推（best-effort，口径见 docs/context-panel-validation.md §8）。
  *
- * wire 注入列表没有作用域字段；/context 的 Project/User/Built-in 是 qodercli
+ * wire 注入列表没有作用域字段；/context 的 Project/User/Plugin/Built-in 是 qodercli
  * 扫盘时按发现路径归类的。这里在解析期按同规则反推：
  * 1. Project —— <qodercli 发起目录> 下的项目级技能目录（`.qoder/skills`、`.agents/skills`、
  *    `.claude/skills`；发起目录配置在 skill-roots.json），优先级最高；
- * 2. User —— 用户级目录（~/.qoder / ~/.claude / ~/.agents / ~/.hermes / plugin marketplaces）；
- * 3. Built-in —— 残余（qodercli 内置，磁盘无对应目录）。
+ * 2. User —— 用户级目录（~/.qoder / ~/.claude / ~/.agents / ~/.hermes）；
+ * 3. Plugin —— 插件注册表（installed_plugins_v2.json）+ 插件缓存目录扫描，
+ *    以 `pluginName:skillName` 命名空间索引（与 wire 注入名一致）；
+ * 4. Built-in —— 残余（qodercli 内置，磁盘无对应目录）。
  *
  * 结果依赖解析机器；同名技能按 project > user 取先命中者（与 /context 一致：
  * 同时存在于项目与用户目录的技能只出现在 Project 组）。
@@ -115,14 +117,87 @@ function userScopeRoots(): string[] {
     path.join(home, ".claude", "skills"),
     path.join(home, ".agents", "skills"),
     path.join(home, ".hermes", "skills"),
-    path.join(home, ".qoder", "plugins", "marketplaces"),
   ];
+}
+
+/**
+ * 从插件注册表 + 缓存目录收集插件技能条目。
+ * 主路径：读 installed_plugins_v2.json，取每个插件的 installPath/skills/；
+ * 兜底：扫 plugins/cache/ 找含 plugin.json 的目录（覆盖未注册但已缓存的 bundler 插件）。
+ * 返回 pluginName → skillsDir 列表，由 buildScopeIndex 以 `pluginName:skillName` 索引。
+ */
+function pluginSkillEntries(): { pluginName: string; skillsDir: string }[] {
+  const home = os.homedir();
+  const pluginsDir = path.join(home, ".qoder", "plugins");
+  const entries: { pluginName: string; skillsDir: string }[] = [];
+  const seen = new Set<string>();
+
+  const add = (pluginName: string, installPath: string) => {
+    const skillsDir = path.join(installPath, "skills");
+    if (seen.has(skillsDir) || !existsSync(skillsDir)) return;
+    seen.add(skillsDir);
+    entries.push({ pluginName, skillsDir });
+  };
+
+  // 1. 注册表（权威来源）
+  try {
+    const raw = readFileSync(path.join(pluginsDir, "installed_plugins_v2.json"), "utf8");
+    const registry = JSON.parse(raw) as { plugins?: Record<string, unknown> };
+    for (const [key, versions] of Object.entries(registry.plugins ?? {})) {
+      const pluginName = key.split("@")[0];
+      if (!Array.isArray(versions)) continue;
+      for (const v of versions) {
+        if (typeof v === "object" && v !== null && "installPath" in v) {
+          add(pluginName, String((v as Record<string, unknown>).installPath));
+        }
+      }
+    }
+  } catch {
+    // 注册表缺失或损坏
+  }
+
+  // 2. 兜底：扫 cache/ 找 plugin.json（覆盖 qodercli-bundler 等未注册插件）
+  const cacheDir = path.join(pluginsDir, "cache");
+  if (existsSync(cacheDir)) {
+    const walkCache = (dir: string, depth: number) => {
+      if (depth > 3) return;
+      let items: Dirent[];
+      try {
+        items = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      // 当前目录是插件根？（含 .qoder-plugin/plugin.json 或 .claude-plugin/plugin.json）
+      for (const manifest of [".qoder-plugin/plugin.json", ".claude-plugin/plugin.json"]) {
+        const mp = path.join(dir, manifest);
+        if (isFileFollowingSymlinks(mp)) {
+          try {
+            const pj = JSON.parse(readFileSync(mp, "utf8")) as { name?: string };
+            if (pj.name) add(pj.name, dir);
+          } catch {
+            // manifest 损坏
+          }
+          return;
+        }
+      }
+      for (const e of items) {
+        if (e.name.startsWith(".")) continue;
+        const child = path.join(dir, e.name);
+        if (e.isDirectory() || (e.isSymbolicLink() && isDirFollowingSymlinks(child))) {
+          walkCache(child, depth + 1);
+        }
+      }
+    };
+    walkCache(cacheDir, 0);
+  }
+
+  return entries;
 }
 
 /** 项目级技能子目录（qodercli 在发起目录下都会扫）；按此顺序取先命中者 */
 const PROJECT_SKILL_SUBDIRS = [".qoder/skills", ".agents/skills", ".claude/skills"];
 
-/** name → { scope, dir }（project / user）；查不到的名字由调用方归为 builtin（无 dir） */
+/** name → { scope, dir }（project / user / plugin）；查不到的名字由调用方归为 builtin（无 dir） */
 export function buildScopeIndex(): Map<string, SkillLocation> {
   const index = new Map<string, SkillLocation>();
   const merge = (dirs: Map<string, string>, scope: SkillScope): void => {
@@ -137,6 +212,14 @@ export function buildScopeIndex(): Map<string, SkillLocation> {
   }
   for (const root of userScopeRoots()) {
     merge(collectSkillDirs(root), "user");
+  }
+  // Plugin 技能以 `pluginName:skillName` 命名空间索引（与 wire 注入名一致）
+  for (const { pluginName, skillsDir } of pluginSkillEntries()) {
+    const dirs = collectSkillDirs(skillsDir);
+    for (const [bareName, dir] of dirs) {
+      const nsName = `${pluginName}:${bareName}`;
+      if (!index.has(nsName)) index.set(nsName, { scope: "plugin", dir });
+    }
   }
   return index;
 }

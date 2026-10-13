@@ -101,8 +101,8 @@ export interface ContextCategoryStats {
   percent: number | null;
 }
 
-/** 技能作用域（/context 三组；unknown = 扫盘反推不可用） */
-export type SkillScope = "project" | "user" | "builtin" | "unknown";
+/** 技能作用域（/context 四组；unknown = 扫盘反推不可用） */
+export type SkillScope = "project" | "user" | "plugin" | "builtin" | "unknown";
 
 /**
  * 技能来源（安装/获得渠道），与 Scope（归属层级）正交：
@@ -211,7 +211,7 @@ export interface ContextStats {
   freeTokens: number | null;
   freePercent: number | null;
   categories: ContextCategoryStats[];
-  /** 按作用域分组（project > user > builtin > unknown）、组内份额降序 */
+  /** 按作用域分组（project > user > plugin > builtin > unknown）、组内份额降序 */
   skills: SkillShareEntry[];
   /** 技能列表注入出现的消息实例数（多轮对话会重复注入，全部计入 Skills 占用） */
   skillListInstances: number;

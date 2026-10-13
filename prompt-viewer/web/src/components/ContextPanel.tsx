@@ -12,8 +12,8 @@ import type {
 } from "../types";
 import { fmtNum, fmtWindow } from "../format";
 import { Badge, SectionCard } from "./SectionCard";
-import { SkillFileModal } from "./SkillFileModal";
 import { CategoryManager } from "./CategoryManager";
+import { skillFileHref } from "../routes";
 import { COLOR_CLASS, childrenMap, depthOf, pathLabel, treeOrder } from "../skillCategories";
 
 type SortKey = "share" | "size" | "name";
@@ -72,14 +72,15 @@ function readColWidths(): number[] {
  */
 const GRID_COLS_STYLE = { gridTemplateColumns: "var(--skill-cols)" } as const;
 
-/** 作用域分组的展示元数据（顺序即渲染顺序，与 /context 的 Project/User/Built-in 一致） */
+/** 作用域分组的展示元数据（顺序即渲染顺序，与 /skills 的 Project/User/Plugin/Built-in 一致） */
 const SCOPE_META: Record<SkillScope, { label: string; icon: string; text: string }> = {
   project: { label: "Project", icon: "📁", text: "text-neon-green" },
   user: { label: "User", icon: "👤", text: "text-neon-cyan" },
+  plugin: { label: "Plugin", icon: "🔌", text: "text-neon-purple" },
   builtin: { label: "Built-in", icon: "⚙️", text: "text-neon-blue" },
   unknown: { label: "未知", icon: "❔", text: "text-mist-400" },
 };
-const SCOPE_ORDER: SkillScope[] = ["project", "user", "builtin", "unknown"];
+const SCOPE_ORDER: SkillScope[] = ["project", "user", "plugin", "builtin", "unknown"];
 
 /** 技能来源的展示元数据（badge 文案 + 配色 + 悬浮说明）；null（未收录）显示「—」 */
 const SOURCE_META: Record<SkillSource, { label: string; cls: string; hint: string }> = {
@@ -177,7 +178,6 @@ const SkillRow = memo(function SkillRow({
   tree,
   saving,
   onAssign,
-  onOpenFile,
 }: {
   s: SkillShareEntry;
   effCat: string | null;
@@ -186,7 +186,6 @@ const SkillRow = memo(function SkillRow({
   tree: CategoryTree;
   saving: boolean;
   onAssign: (name: string, catId: string | null) => void;
-  onOpenFile: (name: string) => void;
 }) {
   return (
     <div
@@ -196,12 +195,26 @@ const SkillRow = memo(function SkillRow({
       style={GRID_COLS_STYLE}
     >
       <span className="flex min-w-0 items-center gap-1.5">
-        <code
-          className={`truncate font-mono text-[12px] font-bold ${s.placeholder ? "text-mist-500" : "text-neon-purple"}`}
-          title={s.name}
-        >
-          {s.name}
-        </code>
+        {s.path ? (
+          <a
+            href={skillFileHref(s.name)}
+            target="_blank"
+            rel="noreferrer"
+            className={`min-w-0 truncate font-mono text-[12px] font-bold underline decoration-ink-600 decoration-dotted underline-offset-2 hover:decoration-neon-cyan ${
+              s.placeholder ? "text-mist-500" : "text-neon-purple"
+            }`}
+            title={`新标签页查看技能文件 · ${shortPath(s.path)}`}
+          >
+            {s.name}
+          </a>
+        ) : (
+          <code
+            className="truncate font-mono text-[12px] font-bold text-mist-500"
+            title="Built-in：磁盘无对应目录，没有技能文件可看"
+          >
+            {s.name}
+          </code>
+        )}
         {s.placeholder && (
           <span className="shrink-0 rounded border border-neon-red/40 bg-neon-red/10 px-1 py-px text-[9.5px] font-bold text-neon-red">
             占位
@@ -238,13 +251,15 @@ const SkillRow = memo(function SkillRow({
           {s.path ? shortPath(s.path) : "内置（磁盘无目录）"}
         </code>
         {s.path && (
-          <button
+          <a
+            href={skillFileHref(s.name)}
+            target="_blank"
+            rel="noreferrer"
             className="shrink-0 rounded px-1 text-[11px] text-mist-400 hover:bg-ink-800 hover:text-neon-cyan"
-            title="查看技能文件（SKILL.md 等）"
-            onClick={() => onOpenFile(s.name)}
+            title="新标签页查看技能文件（SKILL.md 等）"
           >
             📄
-          </button>
+          </a>
         )}
       </span>
       {s.source ? (
@@ -471,7 +486,6 @@ export function ContextPanel({
   const [sortKey, setSortKey] = useState<SortKey>("share");
   const [grouping, setGrouping] = useState<Grouping>(readGrouping);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
-  const [openSkill, setOpenSkill] = useState<string | null>(null);
   const [managing, setManaging] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -735,7 +749,6 @@ export function ContextPanel({
                 tree={tree}
                 saving={saving}
                 onAssign={assign}
-                onOpenFile={setOpenSkill}
               />
             ))}
             {g.children.map(renderGroup)}
@@ -981,7 +994,9 @@ export function ContextPanel({
                 <code className="text-neon-cyan">server/skill-roots.json</code> 配置的 qodercli
                 发起目录下的 <code>.qoder / .agents / .claude</code> 各 <code>skills</code>{" "}
                 目录（含符号链接，与 /context 同规则 project &gt;
-                user 取先命中者）；User 来自用户级技能目录；查不到的名字归为 Built-in（残余启发式）。
+                user 取先命中者）；User 来自用户级技能目录；Plugin 来自插件注册表
+                （<code className="text-neon-cyan">installed_plugins_v2.json</code>）+ 缓存目录扫描，
+                以 <code>pluginName:skillName</code> 命名空间索引；查不到的名字归为 Built-in（残余启发式）。
                 {ctx.skills.every((s) => s.scope === "unknown") && "当前扫盘不可用，全部标记为未知。"}
               </div>
             ) : (
@@ -1023,7 +1038,6 @@ export function ContextPanel({
         )}
       </div>
     </SectionCard>
-    {openSkill && <SkillFileModal name={openSkill} onClose={() => setOpenSkill(null)} />}
     {managing && (
       <CategoryManager
         doc={{ categories: sortedCats, assignments: categoriesDoc.assignments }}
