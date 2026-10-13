@@ -21,6 +21,63 @@ import type { SkillLocation, SkillScope } from "./types.js";
 const MAX_DEPTH = 5;
 
 /**
+ * 当前 qodercli 二进制的内嵌技能名单（`registerBundledSkill({name:"X"})`）。
+ * 这是 /context Built-in 组的真值来源：残余启发式（磁盘查不到 = builtin）原理上推不出
+ * 「只列不注入」的内置技能（disableModelInvocation:true，wire 里没有它们）。
+ *
+ * 已知局限：名单只覆盖 registerBundledSkill 这条注册路径。deep-research / skill-creator
+ * 在 /context 里也显示为 Built-in（`shadowed [shadowed by User]`），但走另一条注册路径，
+ * 二进制里抽不到 —— 那两个名字仍会按磁盘归 User。名单随版本变，老日志用新二进制解析有漂移。
+ */
+const BUNDLED_SKILL_RE = /registerBundledSkill\(\{name:"([^"]+)"/g;
+let bundledCache: { key: string; names: string[] } | null = null;
+
+function currentCliPath(): string | null {
+  const dir = path.join(os.homedir(), ".qoder", "bin", "qodercli");
+  let best: { v: number[]; p: string } | null = null;
+  for (const name of safeListDir(dir)) {
+    const m = /^qodercli-(\d+)\.(\d+)\.(\d+)$/.exec(name);
+    if (!m) continue;
+    const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+    if (!best || v.join(".").localeCompare(best.v.join("."), undefined, { numeric: true }) > 0) {
+      best = { v, p: path.join(dir, name) };
+    }
+  }
+  return best?.p ?? null;
+}
+
+function safeListDir(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+export function readBundledSkillNames(): string[] {
+  const p = currentCliPath();
+  if (!p) return [];
+  let key = p;
+  try {
+    const st = statSync(p);
+    key = `${p}:${st.mtimeMs}:${st.size}`;
+  } catch {
+    return [];
+  }
+  if (bundledCache?.key === key) return bundledCache.names;
+  let names: string[] = [];
+  try {
+    // latin1：二进制按字节读，避免 utf8 解码多字节序列的开销与替换字符干扰
+    const text = readFileSync(p, "latin1");
+    names = [...text.matchAll(BUNDLED_SKILL_RE)].map((m) => m[1]);
+  } catch {
+    names = [];
+  }
+  bundledCache = { key, names };
+  return names;
+}
+
+/**
  * 目录判定：跟随符号链接。
  * 项目 .qoder/skills 下大量条目是指向用户级目录（如 ~/.hermes/skills/*）的
  * 符号链接；Dirent.isDirectory() 对符号链接为 false，若不跟随会把这些技能
@@ -197,6 +254,37 @@ function pluginSkillEntries(): { pluginName: string; skillsDir: string }[] {
 /** 项目级技能子目录（qodercli 在发起目录下都会扫）；按此顺序取先命中者 */
 const PROJECT_SKILL_SUBDIRS = [".qoder/skills", ".agents/skills", ".claude/skills"];
 
+/** 文件型 slash command 的子目录：与技能目录并列的另一类项目/用户级来源 */
+const COMMAND_SUBDIRS = [".qoder/commands", ".claude/commands"];
+
+/**
+ * 收集单文件 slash command（`<dir>/*.md`）：技能名（去 .md）→ 所在目录。
+ * qodercli 把它们与目录型技能并列列出（/context 归 Project/User），但本模块此前只扫
+ * 「含 SKILL.md 的目录」，文件型 command 全漏 → 落进残余启发式被误归 builtin
+ * （create-command 一案：`~/.qoder/commands/create-command.md`，/context 在 User 组）。
+ */
+function collectCommandFiles(dir: string, out = new Map<string, string>()): Map<string, string> {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    if (!e.name.endsWith(".md") || e.name.startsWith(".")) continue;
+    const abs = path.join(dir, e.name);
+    if (!e.isFile() && !(e.isSymbolicLink() && isFileFollowingSymlinks(abs))) continue;
+    const name = e.name.replace(/\.md$/, "");
+    if (!out.has(name)) out.set(name, dir);
+  }
+  return out;
+}
+
+function userCommandRoots(): string[] {
+  const home = os.homedir();
+  return [path.join(home, ".qoder", "commands"), path.join(home, ".claude", "commands")];
+}
+
 /** name → { scope, dir }（project / user / plugin）；查不到的名字由调用方归为 builtin（无 dir） */
 export function buildScopeIndex(): Map<string, SkillLocation> {
   const index = new Map<string, SkillLocation>();
@@ -209,9 +297,16 @@ export function buildScopeIndex(): Map<string, SkillLocation> {
     for (const sub of PROJECT_SKILL_SUBDIRS) {
       merge(collectSkillDirs(path.join(root, sub)), "project");
     }
+    for (const sub of COMMAND_SUBDIRS) {
+      merge(collectCommandFiles(path.join(root, sub)), "project");
+    }
   }
   for (const root of userScopeRoots()) {
     merge(collectSkillDirs(root), "user");
+  }
+  // 文件型 command 排在目录型技能之后：同名时目录型技能优先（merge 只填空位）
+  for (const root of userCommandRoots()) {
+    merge(collectCommandFiles(root), "user");
   }
   // Plugin 技能以 `pluginName:skillName` 命名空间索引（与 wire 注入名一致）
   for (const { pluginName, skillsDir } of pluginSkillEntries()) {

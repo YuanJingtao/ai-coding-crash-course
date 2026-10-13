@@ -187,6 +187,13 @@ export interface SkillShareEntry {
    * 跨日志生效（同名技能在任何日志里都套同一分类）。未归类为 null（进未分类收件箱）。
    */
   categoryId: string | null;
+  /**
+   * 只列不注入：qodercli /context 会列出、但 wire 注入列表里没有的内嵌技能
+   * （disableModelInvocation:true，如 simplify/debug/quest/batch/run-skill-generator）。
+   * 这类行由解析期按当前二进制内嵌名单合成（tokens/chars 为 0），用于复现 /context 的
+   * Built-in 组；与 placeholder（wire 里的纯名字占位条目，仍占据注入体积）是两回事。
+   */
+  listedOnly: boolean;
   /** 技能来源（获得渠道，见 SkillSource）；来自 server/skill-sources.json 全局映射，未收录为 null */
   source: SkillSource | null;
   /**

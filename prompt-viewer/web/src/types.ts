@@ -153,6 +153,8 @@ export interface SkillShareEntry {
   diskDescription: string | null;
   /** 用户手动分类的 id；name→categoryId 全局映射，跨日志生效。未归类为 null（进未分类收件箱） */
   categoryId: string | null;
+  /** 只列不注入：/context 列出但 wire 未注入的内嵌技能（解析期合成的行，tokens 为 0）——与 server 同构 */
+  listedOnly: boolean;
   /** 技能来源（获得渠道）；来自 server/skill-sources.json 全局映射，未收录为 null */
   source: SkillSource | null;
   /** 出处凭据（上游 repo / 可点击地址 / 作者归属 / 证据强度）；无凭据为 null */

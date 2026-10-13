@@ -332,6 +332,8 @@ export function parseWireLog(
   sourceIndex: Map<string, SkillSource> = new Map(),
   /** 出处凭据映射（扫注册表解析，见 skillProvenance.ts）；查不到为 null */
   provenanceIndex: Map<string, SkillProvenance> = new Map(),
+  /** 当前 qodercli 二进制的内嵌技能名单；用于补「只列不注入」的 Built-in 行 */
+  bundledNames: readonly string[] = [],
   /** 磁盘兜底描述读取器（注入，保持本模块不碰 fs）；仅 wire 无描述且有目录时调用 */
   diskDescriptionOf: (dir: string) => string | null = () => null,
 ): ParsedLog {
@@ -585,11 +587,37 @@ export function parseWireLog(
         diskDescription:
           s.description === null && loc ? (diskDescriptionOf(loc.dir) ?? null) : null,
         categoryId: categoryIndex.get(s.name) ?? null,
+        listedOnly: false,
         source: sourceIndex.get(s.name) ?? null,
         provenance: provenanceIndex.get(s.name) ?? null,
       };
-    })
-    .sort((a, b) => SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope] || b.tokens - a.tokens);
+    });
+
+  // qodercli /context 的 Built-in 组还含「只列不注入」的内嵌技能（disableModelInvocation:true，
+  // 如 simplify/debug/quest/batch/run-skill-generator）：wire 里根本没有它们，只渲染注入列表
+  // 就会让 Built-in 组缺员。以当前二进制的内嵌名单为准补行（tokens/份额为 0，placeholder 标记），
+  // 才能复现 /context 的 Built-in 组。名单随 qodercli 版本变，老日志用新二进制解析存在漂移。
+  const wiredNames = new Set(skillShares.map((s) => s.name));
+  for (const name of bundledNames) {
+    if (wiredNames.has(name)) continue;
+    skillShares.push({
+      name,
+      placeholder: true,
+      chars: 0,
+      estTokens: 0,
+      tokens: 0,
+      sharePercent: 0,
+      scope: "builtin",
+      path: null,
+      description: null,
+      diskDescription: null,
+      categoryId: categoryIndex.get(name) ?? null,
+      listedOnly: true,
+      source: sourceIndex.get(name) ?? null,
+      provenance: provenanceIndex.get(name) ?? null,
+    });
+  }
+  skillShares.sort((a, b) => SCOPE_ORDER[a.scope] - SCOPE_ORDER[b.scope] || b.tokens - a.tokens);
 
   const freeTokens = contextLength !== null ? Math.max(contextLength - usedTokens, 0) : null;
   const context: ContextStats = {

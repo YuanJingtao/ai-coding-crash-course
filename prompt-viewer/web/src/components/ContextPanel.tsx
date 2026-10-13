@@ -298,9 +298,17 @@ const SkillRow = memo(function SkillRow({
             {s.name}
           </code>
         )}
-        {s.placeholder && (
+        {s.placeholder && !s.listedOnly && (
           <span className="shrink-0 rounded border border-neon-red/40 bg-neon-red/10 px-1 py-px text-[9.5px] font-bold text-neon-red">
             占位
+          </span>
+        )}
+        {s.listedOnly && (
+          <span
+            className="shrink-0 rounded border border-ink-600 bg-ink-800/40 px-1 py-px text-[9.5px] font-bold text-mist-500"
+            title="只列不注入：qodercli /context 列出但 wire 未注入（disableModelInvocation），零 token 成本；行由当前二进制内嵌名单合成"
+          >
+            只列不注入
           </span>
         )}
       </span>
@@ -598,7 +606,8 @@ export function ContextPanel({
   const usedPctOfBar = (ctx.usedTokens / barTotal) * 100;
   // 全局最大份额（比例条归一化用）；数组按作用域分组排序，首元素不再是最大值
   const maxShare = ctx.skills.length > 0 ? Math.max(...ctx.skills.map((s) => s.sharePercent)) : 0;
-  const placeholderCount = ctx.skills.filter((s) => s.placeholder).length;
+  const placeholderCount = ctx.skills.filter((s) => s.placeholder && !s.listedOnly).length;
+  const listedOnlyCount = ctx.skills.filter((s) => s.listedOnly).length;
 
   const [sortKey, setSortKey] = useState<SortKey>("share");
   const [grouping, setGrouping] = useState<Grouping>(readGrouping);
@@ -772,7 +781,7 @@ export function ContextPanel({
   /** 按当前分组与排序生成 TSV（含分组列），粘贴到 Excel 即成表格 */
   const buildTsv = (): string => {
     const rows: string[][] = [
-      ["分组", "技能", "描述", "位置", "渠道", "作者", "出处", "证据", "分类", "tokens", "占比%", "占位"],
+      ["分组", "技能", "描述", "位置", "渠道", "作者", "出处", "证据", "分类", "tokens", "占比%", "占位", "只列不注入"],
     ];
     const walk = (g: SkillGroup, path: string) => {
       const gpath = path ? `${path} / ${g.label}` : g.label;
@@ -790,7 +799,8 @@ export function ContextPanel({
           cid ? (tree.labels[cid] ?? cid) : "未分类",
           String(s.tokens),
           String(s.sharePercent),
-          s.placeholder ? "是" : "",
+          s.placeholder && !s.listedOnly ? "是" : "",
+          s.listedOnly ? "是" : "",
         ]);
       }
       g.children.forEach((ch) => walk(ch, gpath));
@@ -885,13 +895,14 @@ export function ContextPanel({
     ),
     `  Autocompact: N/A (wire 无对应字段)`,
     hasWindow ? `  Free space: ${ctx.freeTokens} tok (${ctx.freePercent}%)` : `  Free space: —`,
-    `skills (${ctx.skills.length} 注入):`,
+    `skills (${ctx.skills.filter((s) => !s.listedOnly).length} 注入 / ${ctx.skills.length} 列出):`,
     ...ctx.skills.map((s) => {
       const cid = effCat(s.name);
       const catLabel = cid ? (catById.get(cid)?.label ?? cid) : "未分类";
       const srcLabel = s.source ? SOURCE_META[s.source].label : "?";
       const vLabel = vendorLabel(s.provenance) ?? "?";
-      return `  [${SCOPE_META[s.scope].label}·${srcLabel}·${vLabel}·${catLabel}] ${s.name}${s.placeholder ? " [占位]" : ""}: ${s.tokens} tok · ${s.sharePercent}%`;
+      const flag = s.listedOnly ? " [只列不注入]" : s.placeholder ? " [占位]" : "";
+      return `  [${SCOPE_META[s.scope].label}·${srcLabel}·${vLabel}·${catLabel}] ${s.name}${flag}: ${s.tokens} tok · ${s.sharePercent}%`;
     }),
   ].join("\n");
 
@@ -1035,8 +1046,16 @@ export function ContextPanel({
           >
             <div className="mb-1 flex flex-wrap items-center gap-2">
               <span className="font-mono text-[13px] font-bold text-neon-purple">
-                🧩 Skills 明细 · {ctx.skills.length} 个注入技能
+                🧩 Skills 明细 · {ctx.skills.length - listedOnlyCount} 个注入技能
               </span>
+              {listedOnlyCount > 0 && (
+                <Badge
+                  accent="purple"
+                  title="只列不注入：qodercli /context 的 Built-in 组会列出、但 wire 注入列表里没有的内嵌技能（disableModelInvocation）。解析期按当前 qodercli 二进制内嵌名单合成补行以复现 /context；名单随版本变，老日志存在漂移"
+                >
+                  📋 {listedOnlyCount} 个只列不注入
+                </Badge>
+              )}
               {placeholderCount > 0 && (
                 <Badge accent="red" title="占位技能：注入列表里的纯名字条目，模型无法主动调用，但仍占据注入体积">
                   👻 {placeholderCount} 个占位
@@ -1105,7 +1124,9 @@ export function ContextPanel({
             <div className="mb-3 rounded-md border border-neon-amber/25 bg-neon-amber/[0.04] px-3 py-1.5 text-[11.5px] leading-relaxed text-mist-400">
               ⚠️ 口径差异：qodercli <code>/context</code> Skills 页列出的是<b>全部可调用技能</b>（含标记{" "}
               <code className="text-neon-amber">disable-model-invocation: true</code>{" "}
-              的用户手动技能——它们零 token 成本、不进 wire）；此处只列<b>实际注入</b>的技能，份额分母为注入列表。
+              的技能——它们零 token 成本、不进 wire）。本表以 wire 注入列表为主体，另按<b>当前 qodercli 二进制内嵌名单</b>
+              补出「只列不注入」的 Built-in 行以复现 /context 的 Built-in 组（名单随版本变，老日志存在漂移）；
+              份额分母仍为注入列表。
               {ctx.skillListInstances > 1 && `明细取最大的一份注入实例（共 ${ctx.skillListInstances} 份，占用全部计入）。`}
             </div>
 

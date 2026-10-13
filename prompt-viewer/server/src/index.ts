@@ -20,7 +20,7 @@ import { existsSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { classifyWireLog, parseWireLog } from "./parser.js";
-import { buildScopeIndex, listSkillFiles, readSkillDescription } from "./skillScopes.js";
+import { buildScopeIndex, listSkillFiles, readBundledSkillNames, readSkillDescription } from "./skillScopes.js";
 import { buildProvenanceIndex } from "./skillProvenance.js";
 import { readSkillSources, type SkillSourcesDoc } from "./skillSources.js";
 import {
@@ -80,6 +80,16 @@ function provenanceIndex(): Map<string, SkillProvenance> {
     };
   }
   return provenanceCache.index;
+}
+
+/** 二进制内嵌名单：模块内已按文件 mtime 缓存，这里只对齐其余索引的 30s TTL */
+let bundledCache: { at: number; names: string[] } | null = null;
+function bundledNames(): string[] {
+  const now = Date.now();
+  if (!bundledCache || now - bundledCache.at > 30_000) {
+    bundledCache = { at: now, names: readBundledSkillNames() };
+  }
+  return bundledCache.names;
 }
 
 const app = new Hono();
@@ -145,6 +155,7 @@ app.get("/api/logs/:id", async (c) => {
       buildCategoryIndex(categoriesDoc()),
       sourcesDoc().sources,
       provenanceIndex(),
+      bundledNames(),
       readSkillDescription,
     );
     return c.json({ ok: true, log });
