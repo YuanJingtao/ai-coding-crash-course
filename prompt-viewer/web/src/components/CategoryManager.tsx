@@ -26,7 +26,7 @@ const reindex = (cats: SkillCategory[]): SkillCategory[] => {
 
 /**
  * 分类管理弹窗：分类是一棵树（parentId）。支持增 / 改名 / 换色 / 同级排序 /
- * 建子分类 / 改父级 / 删除（子级上提）。复用 SkillFileModal 骨架（fixed 遮罩 + Esc + stopPropagation）。
+ * 建子分类 / 改父级 / 删除（子级上提）。弹窗骨架：fixed 遮罩 + Esc + stopPropagation。
  * 每个离散动作即时写回（单用户本地工具，无需「保存/取消」两态）。
  */
 export function CategoryManager({ doc, onSave, onClose }: Props) {
