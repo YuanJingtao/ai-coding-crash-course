@@ -475,6 +475,7 @@ export function ContextPanel({
   const [managing, setManaging] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     try {
@@ -632,6 +633,47 @@ export function ContextPanel({
           ? b.chars - a.chars
           : b.sharePercent - a.sharePercent,
     );
+
+  /** TSV 单元格：制表符/换行会破坏列对齐，压成空格 */
+  const cell = (v: string | number | null | undefined) =>
+    String(v ?? "").replace(/[\t\r\n]+/g, " ").trim();
+
+  /** 按当前分组与排序生成 TSV（含分组列），粘贴到 Excel 即成表格 */
+  const buildTsv = (): string => {
+    const rows: string[][] = [
+      ["分组", "技能", "描述", "位置", "来源", "分类", "tokens", "占比%", "占位"],
+    ];
+    const walk = (g: SkillGroup, path: string) => {
+      const gpath = path ? `${path} / ${g.label}` : g.label;
+      for (const s of sortItems(g.items)) {
+        const cid = effCat(s.name);
+        rows.push([
+          gpath,
+          s.name,
+          cell(s.description ?? s.diskDescription),
+          s.path ? shortPath(s.path) : "内置",
+          s.source ? SOURCE_META[s.source].label : "",
+          cid ? (tree.labels[cid] ?? cid) : "未分类",
+          String(s.tokens),
+          String(s.sharePercent),
+          s.placeholder ? "是" : "",
+        ]);
+      }
+      g.children.forEach((ch) => walk(ch, gpath));
+    };
+    groups.forEach((g) => walk(g, ""));
+    return rows.map((r) => r.map(cell).join("\t")).join("\n");
+  };
+
+  const copyTsv = async () => {
+    try {
+      await navigator.clipboard.writeText(buildTsv());
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* 忽略剪贴板失败 */
+    }
+  };
 
   // useCallback：引用稳定，SkillRow(memo) 在拖列宽等无关重渲染时不重渲染
   const assign = useCallback(
@@ -910,6 +952,13 @@ export function ContextPanel({
                   </button>
                 ))}
               </span>
+              <button
+                onClick={copyTsv}
+                className="rounded border border-neon-cyan/40 bg-neon-cyan/10 px-2 py-px font-mono text-[11px] text-neon-cyan hover:bg-neon-cyan/20"
+                title="按当前分组与排序复制整表（TSV 制表符分隔），可直接粘贴到 Excel / 表格文档"
+              >
+                {copied ? "✓ 已复制" : "📋 复制表格"}
+              </button>
               <button
                 onClick={() => setManaging(true)}
                 className="rounded border border-neon-purple/40 bg-neon-purple/10 px-2 py-px font-mono text-[11px] text-neon-purple hover:bg-neon-purple/20"
