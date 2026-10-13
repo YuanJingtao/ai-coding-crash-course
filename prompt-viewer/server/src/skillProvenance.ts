@@ -6,9 +6,13 @@
  * 又是 Anthropic 写的（vendor=anthropic）。
  *
  * 凭据分两档，UI 需据此区分可信度：
- * 1. `install-record` —— 本机安装凭据（skills CLI 的 lock 文件），确凿；
+ * 1. `install-record` —— 本机安装凭据（skills CLI 的 lock 文件、插件注册表
+ *    `installed_plugins_v2.json` + 插件 manifest 的 `repository` 字段），确凿；
  * 2. `catalog-match` —— 上游技能目录里的同名条目，只能证明「有个同名技能在那个 repo」，
  *    不证明是从那装的，同名不同源会误判。
+ *
+ * 插件技能以 `pluginName:skillName` 命名空间索引：skills CLI 的 lock 只记裸名，
+ * 匹配不到命名空间名，插件注册表是它们的唯一凭据来源。
  *
  * 结果依赖解析机器：换一台机器注册表不同，出处列会变。与 skillScopes 同类局限。
  * 任何注册表缺失/损坏一律跳过，绝不抛错。
@@ -17,7 +21,7 @@ import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SkillProvenance, SkillVendor } from "./types.js";
-import { readProjectRoots } from "./skillScopes.js";
+import { collectSkillDirs, readProjectRoots } from "./skillScopes.js";
 
 /**
  * 第一方 org（repo owner）→ 厂商标识。不在此表的 owner 一律归 community（公版）：
@@ -243,6 +247,55 @@ function readHubLock(): Map<string, HubHit> {
   return out;
 }
 
+interface PluginHit {
+  repo: string | null;
+  subPath: string | null;
+  installedAt: string | null;
+}
+
+/** 插件 manifest 的 repository 字段；字符串或 npm 风格 `{ url }` 对象都收 */
+function manifestRepo(installPath: string): string | null {
+  for (const rel of [".qoder-plugin/plugin.json", ".claude-plugin/plugin.json"]) {
+    const m = readJson(path.join(installPath, rel));
+    if (!isRecord(m)) continue;
+    const r = m.repository;
+    const raw = typeof r === "string" ? r : isRecord(r) ? str(r.url) : null;
+    const repo = normalizeRepo(raw);
+    if (repo) return repo;
+  }
+  return null;
+}
+
+/**
+ * 插件注册表（installed_plugins_v2.json）：wire 里 `pluginName:skillName` 命名空间技能的
+ * 凭据来源。skills CLI 的 lock 只记**裸名**，匹配不到命名空间名，故插件技能此前零覆盖——
+ * `mattpocock-skills:code-review` 的上游其实写在插件 manifest 的 `repository` 字段里
+ * （github.com/mattpocock/skills），marketplace 目录本身也是该 repo 的 git clone。
+ * 以 `pluginName:skillName` 索引，与 wire 注入名一致。
+ */
+function readPlugins(): Map<string, PluginHit> {
+  const out = new Map<string, PluginHit>();
+  const doc = readJson(path.join(os.homedir(), ".qoder", "plugins", "installed_plugins_v2.json"));
+  if (!isRecord(doc) || !isRecord(doc.plugins)) return out;
+  for (const [key, versions] of Object.entries(doc.plugins)) {
+    const pluginName = key.split("@")[0];
+    if (!Array.isArray(versions)) continue;
+    for (const v of versions) {
+      if (!isRecord(v)) continue;
+      const installPath = str(v.installPath);
+      if (!installPath) continue;
+      const repo = manifestRepo(installPath);
+      const installedAt = str(v.installedAt);
+      for (const [skillName, dir] of collectSkillDirs(installPath)) {
+        const ns = `${pluginName}:${skillName}`;
+        if (out.has(ns)) continue;
+        out.set(ns, { repo, subPath: path.relative(installPath, dir) || null, installedAt });
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * 组装 name → 出处。
  *
@@ -264,9 +317,15 @@ export function buildProvenanceIndex(
   const locks = readLocks();
   const catalogs = readCatalogs();
   const hub = readHubLock();
+  const plugins = readPlugins();
   const out = new Map<string, SkillProvenance>();
 
-  const names = new Set<string>([...locks.keys(), ...hub.keys(), ...vendorOverrides.keys()]);
+  const names = new Set<string>([
+    ...locks.keys(),
+    ...hub.keys(),
+    ...plugins.keys(),
+    ...vendorOverrides.keys(),
+  ]);
   for (const name of catalogs.keys()) {
     if (localNames.has(name)) names.add(name);
   }
@@ -275,18 +334,20 @@ export function buildProvenanceIndex(
     const lock = locks.get(name);
     const cat = catalogs.get(name);
     const hubHit = hub.get(name);
+    const plug = plugins.get(name);
     const override = vendorOverrides.get(name) ?? null;
 
-    // 证据优先级：本机安装凭据 > 上游目录同名 > hub 安装记录（无公网 repo 时只能给 identifier）
-    const repo = lock?.repo ?? cat?.repo ?? null;
-    const subPath = lock?.subPath ?? cat?.subPath ?? null;
-    const evidence: SkillProvenance["evidence"] | null = lock?.repo
-      ? "install-record"
-      : cat?.repo
-        ? "catalog-match"
-        : hubHit
-          ? "install-record"
-          : null;
+    // 证据优先级：本机安装凭据（skills CLI lock / 插件注册表）> 上游目录同名 > hub 安装记录
+    const repo = lock?.repo ?? plug?.repo ?? cat?.repo ?? null;
+    const subPath = lock?.subPath ?? plug?.subPath ?? cat?.subPath ?? null;
+    const evidence: SkillProvenance["evidence"] | null =
+      lock?.repo || plug?.repo
+        ? "install-record"
+        : cat?.repo
+          ? "catalog-match"
+          : hubHit
+            ? "install-record"
+            : null;
 
     const vendor = override ?? vendorOf(repo) ?? (hubHit ? "community" : null);
     if (!repo && !vendor && !hubHit) continue;
@@ -295,7 +356,7 @@ export function buildProvenanceIndex(
       repo,
       url: repo ? githubUrl(repo, subPath) : null,
       evidence: evidence ?? "manual",
-      installedAt: lock?.installedAt ?? null,
+      installedAt: lock?.installedAt ?? plug?.installedAt ?? null,
       vendor,
       // hub 记录的 identifier（如 `official/security/1password`）在无公网 repo 时是唯一线索
       identifier: repo ? null : (hubHit?.identifier ?? null),

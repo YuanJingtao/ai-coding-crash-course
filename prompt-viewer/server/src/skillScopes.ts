@@ -35,7 +35,7 @@ function isDirFollowingSymlinks(p: string): boolean {
 }
 
 /** 递归收集「含 SKILL.md 的目录」：技能名（目录名）→ 目录绝对路径；同名先命中者赢 */
-function collectSkillDirs(root: string, depth = 0, out = new Map<string, string>()): Map<string, string> {
+export function collectSkillDirs(root: string, depth = 0, out = new Map<string, string>()): Map<string, string> {
   if (depth > MAX_DEPTH || !existsSync(root)) return out;
   let entries: Dirent[];
   try {
